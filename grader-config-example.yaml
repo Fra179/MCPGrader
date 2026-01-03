@@ -1,0 +1,38 @@
+grader:
+  working_dir: "/tmp/grader"
+  grades_file: "leaderboard.json"
+  github_pat: "pat_example_1234567890"
+
+assignments:
+  - name: "vector-sum"
+    invite_link: "https://classroom.github.com/a/example1"
+    skip: true
+    preserve_repo_files: false
+    blocking: true
+    test_script_path: "./test_scripts/test_vectorsum.sh"
+
+    slurm_backend:
+      config:
+        slurm_partition: "short"
+        timeout_min: 60
+        mem_gb: 4
+        nodes: 1
+        tasks_per_node: 1
+        cpus_per_task: 2
+        gpus_per_node: 1
+  
+  - name: "mpi-pi-calculation"
+    invite_link: "https://classroom.github.com/a/example2"
+    skip: false
+    preserve_repo_files: false
+    blocking: true
+    test_script_path: "./test_scripts/test_mpi_pi.sh"
+    slurm_backend:
+      config:
+        slurm_partition: "short"
+        timeout_min: 120
+        mem_gb: 8
+        nodes: 1
+        tasks_per_node: 1
+        cpus_per_task: 8
+        gpus_per_node: 0
