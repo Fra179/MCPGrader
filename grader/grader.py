@@ -15,6 +15,8 @@ from runners import *
 from shutil import copyfile
 import subprocess
 from dataclasses import dataclass
+from logger import build_logger
+import os
 
 @dataclass
 class GradeResult:
@@ -55,6 +57,7 @@ class Grader:
         self.log = logger
         self.job_ids: list[tuple] = []
         self.runner: ABRunner = self._get_runner()
+        self.previous_grades: dict = {}
 
     def _grade_assignment(self, assignment_cfg: AssignmentConfig) -> None:
         if assignment_cfg.invite_link:
@@ -77,6 +80,7 @@ class Grader:
                 self.job_ids.append((assignment_cfg, task, None))
                 continue
             
+            self.log.info("Launching grading job for task: %s[%s]", assignment_cfg.name, task.name)
             job_id = self.runner.run(self._grade_task, task, submissions)
             self.job_ids.append((assignment_cfg, task, job_id))
 
@@ -85,26 +89,33 @@ class Grader:
                 self.runner.wait(job_id)
 
     def _grade_task(self, task: AssignmentTaskConfig, submissions: list[SubmissionInfo]) -> list[dict]:
+        task_id = int(os.environ.get('SLURM_PROCID', 0))
         data = []
+        logger = build_logger(name=f"grader.task.{task.name}", level=self.log.level)
+
+        if task_id != 0:
+            return []
 
         for submission in submissions:
-            res = self._grade_submission(submission, task)
+            res = self._grade_submission(submission, task, logger)
             data.append(res)
 
         return data
            
-    def _grade_submission(self, submission: SubmissionInfo, task: AssignmentTaskConfig) -> dict:
-        self.log.info("Grading submission for %s[%s]", submission.repository.full_name, task.name)
+    def _grade_submission(self, submission: SubmissionInfo, task: AssignmentTaskConfig, log: Logger) -> dict:
+        log.info("Grading submission for %s[%s]", submission.repository.full_name, task.name)
         repo_dir = self.wd / (submission.repository.full_name.replace('/', '_') + f"_{task.name}")
-        if not repo_dir.exists():
-            mkdir(repo_dir)
+        
+        if repo_dir.exists():
+            log.info("Cleaning up existing repository directory %s", repo_dir)
+            rmtree(repo_dir)
 
         repo_url = submission.repository.html_url.replace("https://", f"https://{self.pat}@")
-        self.log.debug("Downloading %s", repo_url)
+        log.debug("Downloading %s", repo_url)
         repo = Repo.clone_from(repo_url, repo_dir)
 
         commit_hash = repo.head.commit.hexsha[:7]
-        self.log.debug("Cloned repository at commit %s", commit_hash)
+        log.debug("Cloned repository at commit %s", commit_hash)
 
         result = self._grade_task_submission(task, submission, commit_hash, repo_dir)
             
@@ -138,9 +149,14 @@ class Grader:
             last_line = result.stdout.split('\n')[-1]
 
             # {'passed': 12, 'total': 12, 'times': [442.44458, 664.421387, 886.576111, 354.137085, 442.864655, 663.164917, 884.586487, 354.348022, 443.62854, 664.1828, 885.255188, 354.565033]}
-            data = json.loads(last_line)
-            runtimes = data.get("times", [])
-            status = "graded"
+            try:
+                data = json.loads(last_line)
+                runtimes = data.get("times", [])
+                status = "graded"
+            except json.JSONDecodeError:
+                self.log.error("Failed to parse grading script output as JSON: %s", last_line)
+                status = "error"
+                error = "Failed to parse grading script output as JSON. The script may have crashed or produced invalid output.\nLast line: " + last_line +  "\nFull stderr:\n" + result.stderr
 
             self.log.info("Grading result: %s", data)
             self.log.info("Grading script output: %s", result.stdout)
@@ -203,7 +219,9 @@ class Grader:
         return result
 
     def _get_runner(self) -> ABRunner:
-        return SlurmRunner()
+        logs_dir = Path(self.config.grader.logs_dir) / "slurm_logs"
+        logs_dir.mkdir(parents=True, exist_ok=True)
+        return SlurmRunner(logs_folder=str(logs_dir))
 
     def _load_grades_file(self) -> dict:
         grades_file_path = Path(self.config.grader.grades_file)
@@ -219,6 +237,7 @@ class Grader:
 
     def grade(self):
         data = self._load_grades_file()
+        self.previous_grades = data
         self.jobs = []
 
         for assignment in self.config.assignments:

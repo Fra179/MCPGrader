@@ -2,20 +2,21 @@ from .ABRunner import ABRunner
 from config.configs import AssignmentTaskConfig
 import submitit
 from submitit import Job
+from typing import Callable
 
 class SlurmRunner(ABRunner):
-    def __init__(self):
+    def __init__(self, logs_folder: str = "./logs"):
         super().__init__()
-        self.executor = submitit.AutoExecutor(folder="/tmp/slurm_jobs")
+        self.executor = submitit.AutoExecutor(folder=logs_folder)
         self.jobs: list[Job] = []
         self.job_idx = 0
 
-    def run(self, grading_function: callable[[AssignmentTaskConfig, ...]], task: AssignmentTaskConfig, *args, **kwargs) -> int:
+    def run(self, grading_function: Callable[[AssignmentTaskConfig, ...]], task: AssignmentTaskConfig, *args, **kwargs) -> int:
         if not task.slurm_backend.config.get("slurm_job_name"):
             task.slurm_backend.config["slurm_job_name"] = f"grading_{task.name}"
 
         self.executor.update_parameters(**task.slurm_backend.config)
-        job = self.executor.submit(grading_function, *[task] + list(args), **kwargs)
+        job: Job = self.executor.submit(grading_function, *[task] + list(args), **kwargs)
         jobid = self.job_idx
         self.jobs.append(job)
         self.job_idx += 1
