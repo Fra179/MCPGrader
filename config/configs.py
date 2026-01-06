@@ -7,6 +7,14 @@ from os import path
 
 @dataclass_json
 @dataclass
+class SlurmBackendConfig:
+    config: dict[str, Any] = None
+
+    def assert_valid(self) -> None:
+        assert isinstance(self.config, dict), "config must be a dictionary"
+
+@dataclass_json
+@dataclass
 class AssignmentTaskConfig:
     name: str
     test_script_path: str
@@ -45,14 +53,6 @@ class AssignmentConfig:
         # assert no duplicate task names
         task_names = [task.name for task in self.tasks]
         assert len(task_names) == len(set(task_names)), f"Duplicate task names found in assignment {self.name}"
-
-@dataclass_json
-@dataclass
-class SlurmBackendConfig:
-    config: dict[str, Any] = None
-
-    def assert_valid(self) -> None:
-        assert isinstance(self.config, dict), "config must be a dictionary"
 
 @dataclass_json
 @dataclass

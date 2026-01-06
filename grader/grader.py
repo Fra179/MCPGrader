@@ -219,7 +219,7 @@ class Grader:
         return result
 
     def _get_runner(self) -> ABRunner:
-        logs_dir = Path(self.config.grader.logs_dir) / "slurm_logs"
+        logs_dir = Path(self.config.grader.working_dir) / "slurm_logs"
         logs_dir.mkdir(parents=True, exist_ok=True)
         return SlurmRunner(logs_folder=str(logs_dir))
 
