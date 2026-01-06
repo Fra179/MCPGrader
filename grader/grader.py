@@ -1,5 +1,6 @@
+from collections import defaultdict
 import json
-from config import ProgramConfig, AssignmentConfig
+from config import ProgramConfig, AssignmentConfig, AssignmentTaskConfig
 from git import Repo
 from gh import GithubClassroomAPI
 from gh.filters import By
@@ -13,6 +14,37 @@ from logging import Logger
 from runners import *
 from shutil import copyfile
 import subprocess
+from dataclasses import dataclass
+
+@dataclass
+class GradeResult:
+    name: str
+    commit_hash: str
+    _status: str
+    error: str
+    stdout: str
+    runtimes: list[float]
+    data: dict
+
+    def to_dict(self) -> dict:
+        return {
+            "name": self.name,
+            "commit_hash": self.commit_hash,
+            "status": self.status,
+            "error": self.error,
+            "stdout": self.stdout,
+            "avg_runtime": sum(self.runtimes) / len(self.runtimes) if self.runtimes else 0.0,
+            "data": self.data
+        }
+    
+    @property
+    def status(self) -> str:
+        return self._status
+    
+    @status.setter
+    def status(self, value: str) -> None:
+        if self._status != "error":
+            self._status = value
 
 class Grader:
     def __init__(self, config: ProgramConfig, pat: str, logger: Logger) -> None:
@@ -21,8 +53,10 @@ class Grader:
         self.classroom = GithubClassroomAPI(pat)
         self.wd = Path(config.grader.working_dir)
         self.log = logger
+        self.job_ids: list[tuple] = []
+        self.runner: ABRunner = self._get_runner()
 
-    def _grade_assignment(self, assignment_cfg: AssignmentConfig) -> list[dict]:
+    def _grade_assignment(self, assignment_cfg: AssignmentConfig) -> None:
         if assignment_cfg.invite_link:
             assignment = self.classroom.get_assignment_by(By.INVITE_LINK, assignment_cfg.invite_link)
         elif assignment_cfg.slug:
@@ -33,17 +67,35 @@ class Grader:
             raise GitHubException("No valid identifier provided for assignment.")
 
         submissions = self.classroom.get_submissions_for_assignment(assignment.id)
-        grades = []
+
+
+        for task in assignment_cfg.tasks:
+            blocking = task.blocking
+
+            if task.skip:
+                self.log.info("Skipping grading for task: %s[%s]", assignment_cfg.name, task.name)
+                self.job_ids.append((assignment_cfg, task, None))
+                continue
+            
+            job_id = self.runner.run(self._grade_task, task, submissions)
+            self.job_ids.append((assignment_cfg, task, job_id))
+
+            if blocking:
+                self.log.info("Waiting for blocking task %s[%s] to complete", assignment_cfg.name, task.name)
+                self.runner.wait(job_id)
+
+    def _grade_task(self, task: AssignmentTaskConfig, submissions: list[SubmissionInfo]) -> list[dict]:
+        data = []
 
         for submission in submissions:
-            grade = self._grade_submission(submission, assignment_cfg)
-            grades.append(grade)
+            res = self._grade_submission(submission, task)
+            data.append(res)
 
-        return grades
-
-    def _grade_submission(self, submission: SubmissionInfo, assignment_cfg: AssignmentConfig) -> dict:
-        self.log.info("Grading submission for %s", submission.repository.full_name)
-        repo_dir = self.wd / submission.repository.full_name.replace('/', '_')
+        return data
+           
+    def _grade_submission(self, submission: SubmissionInfo, task: AssignmentTaskConfig) -> dict:
+        self.log.info("Grading submission for %s[%s]", submission.repository.full_name, task.name)
+        repo_dir = self.wd / (submission.repository.full_name.replace('/', '_') + f"_{task.name}")
         if not repo_dir.exists():
             mkdir(repo_dir)
 
@@ -54,10 +106,16 @@ class Grader:
         commit_hash = repo.head.commit.hexsha[:7]
         self.log.debug("Cloned repository at commit %s", commit_hash)
 
+        result = self._grade_task_submission(task, submission, commit_hash, repo_dir)
+            
+        return result
+    
+    def _grade_task_submission(self, task: AssignmentTaskConfig, submission: SubmissionInfo, commit_hash: str, repo_dir: Path) -> dict:
         # Use slurm to run the grading script
         # Copy the grading script to the repo directory
-        grading_script_dest = repo_dir / Path(assignment_cfg.test_script_path).name
-        copyfile(assignment_cfg.test_script_path, grading_script_dest)
+
+        grading_script_dest = repo_dir / Path(task.test_script_path).name
+        copyfile(task.test_script_path, grading_script_dest)
 
         # Make the grading script executable
         grading_script_dest.chmod(0o755)
@@ -91,18 +149,59 @@ class Grader:
             error = e.stderr
             stdout = e.stdout
             status = "error"
-        
-        # Cleanup repository files if not preserving
-        if not assignment_cfg.preserve_repo_files:
-            rmtree(repo_dir)
-            self.log.info("Deleted repository files for %s", submission.repository.full_name)
-        self.log.info("Finished grading %s", submission.repository.full_name)
 
         runtime = sum(runtimes) / len(runtimes) if runtimes else 0.0
-        self.log.info("Average runtime for %s: %.4f ms", submission.repository.full_name, runtime)
+        self.log.info("Average runtime for %s [%s]: %.4f ms", submission.repository.full_name, task.name, runtime)
 
-        return {"name": submission.pretty_users, "commit_hash": commit_hash, "status": status, "error": error, "stdout": stdout, "avg_runtime": runtime, "data": data}  # Placeholder grade
+        return {"name": submission.pretty_users, "repo_dir": str(repo_dir), "commit_hash": commit_hash, "status": status, "error": error, "stdout": stdout, "runtimes": runtimes, "data": data}  # Placeholder grade
+ 
+    def _get_result_defaultdict(self) -> dict:
+        return defaultdict(
+            lambda: defaultdict(
+                lambda: GradeResult("", "", "graded", "", "", [], {})
+                )
+            )
+                
+    def _retrieve_results(self, existing_data: dict) -> dict:
+        data: dict[str, dict[str, GradeResult]] = self._get_result_defaultdict()
         
+        repos_to_cleanup = set()
+
+        for assignment_cfg, task, jobid in self.job_ids:
+            if jobid is None:
+                self.log.info("Skipping result retrieval for skipped task: %s[%s]", assignment_cfg.name, task.name)    
+                continue
+
+            task_results = self.runner.collect_results(jobid)
+            self.log.info("Collected results for %s[%s]", assignment_cfg.name, task.name)
+
+            for result in task_results:
+                name = result["name"]
+                data[assignment_cfg.name][name].name = name
+                data[assignment_cfg.name][name].commit_hash = result["commit_hash"]
+                data[assignment_cfg.name][name].status = result["status"]  # This uses the property setter, see the implementation
+                data[assignment_cfg.name][name].error += f"\n\n--- Stderr for task {task.name} ---\n" + result["error"]
+                data[assignment_cfg.name][name].stdout += f"\n\n--- Stdout for task {task.name} ---\n" + result["stdout"]
+                data[assignment_cfg.name][name].runtimes.extend(result["runtimes"])
+                data[assignment_cfg.name][name].data[task.name] = result["data"]
+
+            
+                repo_dir = Path(result["repo_dir"])
+                if not assignment_cfg.preserve_repo_files:
+                    repos_to_cleanup.add(repo_dir)
+
+        result = existing_data
+
+        for assignment_name, students in data.items():
+            result[assignment_name] = [student.to_dict() for student in students.values()]
+
+        # Cleanup repositories
+        for repo_dir in repos_to_cleanup:
+            rmtree(repo_dir)
+            self.log.debug("Deleted repository files for %s", repo_dir.name.replace('_', '/'))
+        
+        return result
+
     def _get_runner(self) -> ABRunner:
         return SlurmRunner()
 
@@ -119,31 +218,16 @@ class Grader:
             json.dump(data, f, indent=4)
 
     def grade(self):
-        runner = self._get_runner()
-        job_ids = []
         data = self._load_grades_file()
+        self.jobs = []
 
         for assignment in self.config.assignments:
-            blocking = assignment.blocking
-            if assignment.skip:
-                self.log.info("Skipping assignment: %s", assignment.name)
-                job_ids.append(None)
-                continue
+            self.log.info("Launching grading job for assignment: %s", assignment.name)
+            self._grade_assignment(assignment)
 
-            self.log.info("Launching grading job for assignment: %s (blocking=%s)", assignment.name, blocking)
+        self.log.info("Waiting for all grading jobs to complete")
+        self.runner.wait_all()
 
-            jobid = runner.run(self._grade_assignment, assignment)
-            job_ids.append(jobid)
+        results = self._retrieve_results(data)
 
-            if blocking:
-                self.log.info("Waiting for blocking assignment: %s", assignment.name)
-                runner.wait(jobid)
-
-        for jobid, assignment in zip(job_ids, self.config.assignments):
-            if assignment.skip:
-                continue
-            results = runner.collect_results(jobid)
-            data[assignment.name] = results
-            self._save_grades_file(data)
-
-            self.log.info("Saved grades for assignment: %s", assignment.name)
+        self._save_grades_file(results)

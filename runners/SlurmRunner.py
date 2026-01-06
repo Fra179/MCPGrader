@@ -1,5 +1,5 @@
 from .ABRunner import ABRunner
-from config.configs import AssignmentConfig
+from config.configs import AssignmentTaskConfig
 import submitit
 from submitit import Job
 
@@ -10,12 +10,12 @@ class SlurmRunner(ABRunner):
         self.jobs: list[Job] = []
         self.job_idx = 0
 
-    def run(self, grading_function: callable[[AssignmentConfig]], assignment: AssignmentConfig) -> int:
-        if not assignment.slurm_backend.config.get("slurm_job_name"):
-            assignment.slurm_backend.config["slurm_job_name"] = f"grading_{assignment.name}"
+    def run(self, grading_function: callable[[AssignmentTaskConfig, ...]], task: AssignmentTaskConfig, *args, **kwargs) -> int:
+        if not task.slurm_backend.config.get("slurm_job_name"):
+            task.slurm_backend.config["slurm_job_name"] = f"grading_{task.name}"
 
-        self.executor.update_parameters(**assignment.slurm_backend.config)
-        job = self.executor.submit(grading_function, assignment)
+        self.executor.update_parameters(**task.slurm_backend.config)
+        job = self.executor.submit(grading_function, *[task] + list(args), **kwargs)
         jobid = self.job_idx
         self.jobs.append(job)
         self.job_idx += 1

@@ -1,9 +1,9 @@
 from abc import ABC, abstractmethod
-from config.configs import AssignmentConfig
+from config.configs import AssignmentTaskConfig
 
 class ABRunner(ABC):
     @abstractmethod
-    def run(self, grading_function: callable[[AssignmentConfig]], assignment: AssignmentConfig) -> int:
+    def run(self, grading_function: callable[[AssignmentTaskConfig, ...]], task: AssignmentTaskConfig, *args, **kwargs) -> int:
         raise NotImplementedError()
     
     @abstractmethod
