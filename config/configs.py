@@ -13,6 +13,13 @@ class SlurmBackendConfig:
     def assert_valid(self) -> None:
         assert isinstance(self.config, dict), "config must be a dictionary"
 
+    def performance_hash(self) -> str:
+        # Create a hash based on the config dictionary for performance comparison
+        hasher = hashlib.sha256()
+        config_str = str(sorted(self.config.items())) if self.config else ''
+        hasher.update(config_str.encode('utf-8'))
+        return hasher.hexdigest()
+
 @dataclass_json
 @dataclass
 class AssignmentTaskConfig:
@@ -30,6 +37,23 @@ class AssignmentTaskConfig:
         assert isinstance(self.skip, bool), "skip must be a boolean"
         assert isinstance(self.blocking, bool), "blocking must be a boolean"
 
+    def performance_hash(self) -> str:
+        # Create a hash based on relevant fields for performance comparison
+        # If these fields change, we discard previous cached results
+        hasher = hashlib.sha256()
+        hasher.update(self.name.encode('utf-8'))
+        hasher.update(self.test_script_path.encode('utf-8'))
+
+        # insert also the contents of the test script to the hash
+        with open(self.test_script_path, 'rb') as f:
+            hasher.update(f.read())
+
+        # hasher.update(str(self.skip).encode('utf-8'))
+        # hasher.update(str(self.blocking).encode('utf-8'))
+
+        # Include slurm_backend config in the hash
+        hasher.update(self.slurm_backend.performance_hash().encode('utf-8'))
+        return hasher.hexdigest()
 
 @dataclass_json
 @dataclass

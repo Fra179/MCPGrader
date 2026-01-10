@@ -1,6 +1,6 @@
 from collections import defaultdict
 import json
-from typing import Iterable
+from typing import Any, Iterable
 from config import ProgramConfig, AssignmentConfig, AssignmentTaskConfig
 from git import Repo, Git
 from gh import GithubClassroomAPI
@@ -71,18 +71,18 @@ class Grader:
         commit_hash = self.git.ls_remote(repo_url, "HEAD").split()[0]
         return commit_hash
     
-    def _open_cache_file(self, task: AssignmentTaskConfig) -> dict[str, str]:
+    def _open_cache_file(self, task: AssignmentTaskConfig) -> dict[str, Any]:
         cache_file_path = self.wd / ".cache" / f"{task.name}_cache.json"
         if not cache_file_path.exists():
             with open(cache_file_path, 'w') as cache_file:
-                json.dump({}, cache_file)
+                json.dump({"perf_hash": task.performance_hash(), "cache": {}}, cache_file)
         
         with open(cache_file_path, 'r') as cache_file:
-            cache: dict[str, str] = json.load(cache_file)
+            cache: dict[str, Any] = json.load(cache_file)
         
         return cache
     
-    def _save_cache_file(self, task: AssignmentTaskConfig, cache: dict[str, str]) -> None:
+    def _save_cache_file(self, task: AssignmentTaskConfig, cache: dict[str, Any]) -> None:
         cache_file_path = self.wd / ".cache" / f"{task.name}_cache.json"
         with open(cache_file_path, 'w') as cache_file:
             json.dump(cache, cache_file, indent=4)
@@ -90,12 +90,17 @@ class Grader:
     def _filter_updated_submissions(self, task: AssignmentTaskConfig, submissions: Iterable[SubmissionInfo]) -> list[SubmissionInfo]:
         cache = self._open_cache_file(task)
         updated_submissions = []
+
+        if cache.get("perf_hash") != task.performance_hash():
+            self.log.info("Task configuration changed for %s, regrading all submissions.", task.name)
+            cache["perf_hash"] = task.performance_hash()
+            cache["cache"] = {}
     
         for submission in submissions:
             commit_hash = self._get_latest_commit_hash(submission)
-            if cache.get(submission.repository.html_url) != commit_hash:
+            if cache["cache"].get(submission.repository.html_url) != commit_hash:
                 updated_submissions.append(submission)
-            cache[submission.repository.html_url] = commit_hash
+            cache["cache"][submission.repository.html_url] = commit_hash
 
         self._save_cache_file(task, cache)
 
