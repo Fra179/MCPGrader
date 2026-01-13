@@ -83,6 +83,7 @@ class AssignmentConfig:
 class GraderConfig:
     working_dir: str
     grades_file: str
+    sentry_dsn: Optional[str] = None
     github_pat: Optional[str] = None
 
     def assert_valid(self) -> None:
