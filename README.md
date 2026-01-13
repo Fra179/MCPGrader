@@ -141,6 +141,9 @@ assignments:
 
 - **`test_script_path`** (required): Absolute or relative path to the test script that will be executed in each student's repository for this task.
 
+>### [!] Important [!]
+>When writing your test script don't forget to launch the student's script with either `srun`, `mpirun` or a similar command that will also schedule the process on the cluster!
+
 ### Step 4: Configure SLURM Backend for Tasks
 
 The `slurm_backend.config` section within each task accepts parameters that are passed directly to **submitit**, which manages SLURM job submissions. Each task can have different SLURM resource requirements.
@@ -422,5 +425,3 @@ Copyright (C) 2026
 This program is free software: you can redistribute it and/or modify it under the terms of the GNU General Public License as published by the Free Software Foundation, either version 3 of the License, or (at your option) any later version.
 
 This program is distributed in the hope that it will be useful, but WITHOUT ANY WARRANTY; without even the implied warranty of MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE. See the GNU General Public License for more details.
-
-
