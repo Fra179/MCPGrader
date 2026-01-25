@@ -4,6 +4,13 @@ grader:
   github_pat: "pat_example_1234567890"
   sentry_dsn: ""
 
+pusher:
+  github_repo: "user/MCPLeaderboard"
+  github_pat: "pat_example_1234567890" # Can be the same as grader.github_pat
+  save_file: "data/leaderboard.json"
+  push: true
+
+
 assignments:
   - name: "vector-sum"
     invite_link: "https://classroom.github.com/a/example1"

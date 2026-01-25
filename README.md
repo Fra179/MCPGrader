@@ -10,8 +10,9 @@ An automated grading system for GitHub Classroom assignments that clones student
 - [Configuration](#configuration)
   - [Step 1: Copy the Example Configuration](#step-1-copy-the-example-configuration)
   - [Step 2: Configure the Grader Section](#step-2-configure-the-grader-section)
-  - [Step 3: Configure Assignments](#step-3-configure-assignments)
-  - [Step 4: Configure SLURM Backend](#step-4-configure-slurm-backend)
+  - [Step 3: Configure the Pusher Section](#step-3-configure-the-pusher-section)
+  - [Step 4: Configure Assignments](#step-4-configure-assignments)
+  - [Step 5: Configure SLURM Backend](#step-5-configure-slurm-backend)
 - [GitHub Personal Access Token](#github-personal-access-token)
 - [Running the Grader](#running-the-grader)
 - [Setting Up as a Recurrent Task](#setting-up-as-a-recurrent-task)
@@ -36,6 +37,7 @@ This grading system automates the process of:
 - **Blocking/Non-blocking Execution**: Control whether to wait for assignment completion
 - **Repository Cleanup**: Option to preserve or delete cloned repositories
 - **Leaderboard Generation**: JSON output with all results and metrics
+- **GitHub Integration**: Push leaderboard results directly to a GitHub repository
 
 ## Installation
 
@@ -73,8 +75,37 @@ grader:
 - **`working_dir`**: Directory where student repositories will be cloned. This directory must exist before running the grader.
 - **`grades_file`**: Path to the output JSON file containing all grading results and the leaderboard.
 - **`github_pat`**: (Optional) Your GitHub Personal Access Token. Can be omitted if provided via environment variable (see [GitHub Personal Access Token](#github-personal-access-token) section).
+- **`sentry_dsn`**: (Optional) Sentry DSN for error tracking and monitoring. Leave empty if not using Sentry.
 
-### Step 3: Configure Assignments
+### Step 3: Configure the Pusher Section
+
+The `pusher` section is optional and allows you to automatically push the generated leaderboard to a GitHub repository:
+
+```yaml
+pusher:
+  github_repo: "user/MCPLeaderboard"
+  github_pat: "pat_example_1234567890"
+  save_file: "data/leaderboard.json"
+  push: true
+```
+
+**Field Explanations:**
+
+- **`github_repo`**: The target GitHub repository in the format `owner/repo` where the leaderboard will be pushed (e.g., `"myorg/leaderboard"`).
+- **`github_pat`**: GitHub Personal Access Token for pushing to the target repository. Can be the same as `grader.github_pat` or a different token if using separate accounts. Can be omitted if provided via environment variable.
+- **`save_file`**: Path within the target repository where the leaderboard JSON file will be saved (e.g., `"data/leaderboard.json"`).
+- **`push`**: Whether to enable pushing to GitHub (default: `false`). Set to `true` to automatically commit and push the leaderboard after grading completes.
+
+**Example Workflow:**
+When `push: true`, the pusher will:
+1. Clone the target GitHub repository
+2. Write the leaderboard data to the specified `save_file`
+3. Commit the changes with an appropriate commit message
+4. Push the changes to the repository
+
+This is useful for maintaining a public leaderboard that updates automatically with each grading run.
+
+### Step 4: Configure Assignments
 
 Add assignments to the `assignments` list. Each assignment can have multiple tasks that run different test scripts with different configurations:
 
@@ -115,7 +146,7 @@ assignments:
             cpus_per_task: 4
             gpus_per_node: 1
 ```
-
+5
 **Assignment-Level Field Explanations:**
 
 - **`name`** (required): A unique identifier for the assignment. Used as the key in the output JSON.

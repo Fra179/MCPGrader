@@ -18,6 +18,7 @@ import subprocess
 from .structs import GradeResult
 from logger import build_logger
 import os
+from pusher.github_pusher import GithubPusher
 
 class Grader:
     def __init__(self, config: ProgramConfig, pat: str, logger: Logger) -> None:
@@ -272,3 +273,8 @@ class Grader:
         results = self._retrieve_results(data)
 
         self._save_grades_file(results)
+
+        if self.config.pusher and self.config.pusher.push:
+            pusher = GithubPusher(self.config.pusher)
+            commit_sha = pusher.push_results(self.config.grader.grades_file)
+            self.log.info("Pushed results to GitHub repository %s at commit %s", self.config.pusher.github_repo, commit_sha)

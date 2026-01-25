@@ -93,9 +93,24 @@ class GraderConfig:
 
 @dataclass_json
 @dataclass
+class PusherConfig:
+    github_repo: str
+    github_pat: str
+    save_file: str
+    push: bool = True
+
+    def assert_valid(self) -> None:
+        assert isinstance(self.github_repo, str) and self.github_repo, "github_repo must be a non-empty string"
+        assert isinstance(self.github_pat, str) and self.github_pat, "github_pat must be a non-empty string"
+        assert isinstance(self.save_file, str) and self.save_file, "save_file must be a non-empty string"
+        assert isinstance(self.push, bool), "push must be a boolean"
+
+@dataclass_json
+@dataclass
 class ProgramConfig:
     grader: GraderConfig
     assignments: List[AssignmentConfig]
+    pusher: Optional[PusherConfig] = None
 
     def assert_valid(self) -> None:
         for assignment in self.assignments:
@@ -106,3 +121,6 @@ class ProgramConfig:
         assert len(assignment_names) == len(set(assignment_names)), "Duplicate assignment names found"
 
         self.grader.assert_valid()
+
+        if self.pusher:
+            self.pusher.assert_valid()
