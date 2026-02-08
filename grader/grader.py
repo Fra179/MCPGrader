@@ -120,8 +120,11 @@ class Grader:
         submissions = filter(lambda x: x.commit_count > 0, submissions)
 
         for submission in self._filter_updated_submissions(task, submissions):
-            res = self._grade_submission(submission, task, logger)
-            data.append(res)
+            try:
+                res = self._grade_submission(submission, task, logger)
+                data.append(res)
+            except Exception as e:
+                logger.error("Failed to grade submission %s[%s]: %s", submission.repository.full_name, task.name, str(e))
 
         return data
            
@@ -219,7 +222,7 @@ class Grader:
                 data[assignment_cfg.name][name].update_from_dict(result, task.name)
             
                 repo_dir = Path(result["repo_dir"])
-                if not assignment_cfg.preserve_repo_files:
+                if not assignment_cfg.preserve_repo_files and repo_dir.exists():
                     repos_to_cleanup.add(repo_dir)
 
         result = existing_data
@@ -236,7 +239,7 @@ class Grader:
 
         # Cleanup repositories
         for repo_dir in repos_to_cleanup:
-            rmtree(repo_dir)
+            rmtree(repo_dir, ignore_errors=True)
             self.log.debug("Deleted repository files for %s", repo_dir.name.replace('_', '/'))
         
         return result
