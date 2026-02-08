@@ -31,6 +31,7 @@ class Grader:
         self.job_ids: list[tuple] = []
         self.runner: ABRunner = self._get_runner()
         self.previous_grades: dict = {}
+        self.__cache = {}
 
         if not (self.wd / ".cache").exists():
             mkdir(self.wd / ".cache")
@@ -89,22 +90,19 @@ class Grader:
             json.dump(cache, cache_file, indent=4)
 
     def _filter_updated_submissions(self, task: AssignmentTaskConfig, submissions: Iterable[SubmissionInfo]) -> list[SubmissionInfo]:
-        cache = self._open_cache_file(task)
+        self.__cache[task] = self._open_cache_file(task)
         updated_submissions = []
 
-        if cache.get("perf_hash") != task.performance_hash():
+        if self.__cache[task].get("perf_hash") != task.performance_hash():
             self.log.info("Task configuration changed for %s, regrading all submissions.", task.name)
-            cache["perf_hash"] = task.performance_hash()
-            cache["cache"] = {}
+            self.__cache[task]["perf_hash"] = task.performance_hash()
+            self.__cache[task]["cache"] = {}
     
         for submission in submissions:
             commit_hash = self._get_latest_commit_hash(submission)
-            if cache["cache"].get(submission.repository.html_url) != commit_hash:
+            if self.__cache[task]["cache"].get(submission.repository.html_url) != commit_hash:
                 updated_submissions.append(submission)
-            cache["cache"][submission.repository.html_url] = commit_hash
-
-        # TODO: Fix possible logic bug in which updated submissions are not graded (grader crashes) but the cache is updated anyway
-        self._save_cache_file(task, cache)
+            self.__cache[task]["cache"][submission.repository.html_url] = commit_hash
 
         return updated_submissions
 
@@ -281,3 +279,7 @@ class Grader:
             pusher = GithubPusher(self.config.pusher)
             commit_sha = pusher.push_results(self.config.grader.grades_file)
             self.log.info("Pushed results to GitHub repository %s at commit %s", self.config.pusher.github_repo, commit_sha)
+
+        for (task, cache) in self.__cache.items():
+            self._save_cache_file(task, cache)
+            self.log.debug("Saved cache for task %s", task.name)
