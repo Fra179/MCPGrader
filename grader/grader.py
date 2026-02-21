@@ -2,7 +2,7 @@ from collections import defaultdict
 import json
 from typing import Any, Iterable
 from config import ProgramConfig, AssignmentConfig, AssignmentTaskConfig
-from git import Repo, Git
+from git import Repo, Git, exc
 from gh import GithubClassroomAPI
 from gh.filters import By
 from gh.exceptions import GitHubException
@@ -32,6 +32,7 @@ class Grader:
         self.runner: ABRunner = self._get_runner()
         self.previous_grades: dict = {}
         self.__cache = {}
+        self.__name_to_repo_url = {}
 
         if not (self.wd / ".cache").exists():
             mkdir(self.wd / ".cache")
@@ -47,6 +48,10 @@ class Grader:
             raise GitHubException("No valid identifier provided for assignment.")
         
         return assignment
+    
+    def _open_caches_for_assignment(self, assignment_cfg: AssignmentConfig) -> None:
+        for task in assignment_cfg.tasks:
+            self.__cache[task] = self._open_cache_file(task, assignment_cfg)
 
     def _grade_assignment(self, assignment_cfg: AssignmentConfig) -> None:
         assignment = self._get_assignment(assignment_cfg)
@@ -73,38 +78,48 @@ class Grader:
         commit_hash = self.git.ls_remote(repo_url, "HEAD").split()[0]
         return commit_hash
     
-    def _open_cache_file(self, task: AssignmentTaskConfig) -> dict[str, Any]:
-        cache_file_path = self.wd / ".cache" / f"{task.name}_cache.json"
+    def _open_cache_file(self, task: AssignmentTaskConfig, assignment: AssignmentConfig) -> dict[str, Any]:
+        cache_file_path = self.wd / ".cache" / f"{assignment.name}_{task.name}_cache.json"
         if not cache_file_path.exists():
             with open(cache_file_path, 'w') as cache_file:
                 json.dump({"perf_hash": task.performance_hash(), "cache": {}}, cache_file)
         
         with open(cache_file_path, 'r') as cache_file:
             cache: dict[str, Any] = json.load(cache_file)
+
+        if cache.get("perf_hash") != task.performance_hash():
+            cache["perf_hash"] = task.performance_hash()
+            cache["cache"] = {} 
         
         return cache
     
-    def _save_cache_file(self, task: AssignmentTaskConfig, cache: dict[str, Any]) -> None:
-        cache_file_path = self.wd / ".cache" / f"{task.name}_cache.json"
+    def _save_cache_file(self, task: AssignmentTaskConfig, assignment: AssignmentConfig, cache: dict[str, Any]) -> None:
+        cache_file_path = self.wd / ".cache" / f"{assignment.name}_{task.name}_cache.json"
         with open(cache_file_path, 'w') as cache_file:
             json.dump(cache, cache_file, indent=4)
 
+    def _save_cache_file_for_assignment(self, assignment: AssignmentConfig) -> None:
+        for task in assignment.tasks:
+            cache = self.__cache.get(task)
+            if cache is not None:
+                self._save_cache_file(task, assignment, cache)
+                self.log.debug("Saved cache for task %s[%s]", assignment.name, task.name)
+
     def _filter_updated_submissions(self, task: AssignmentTaskConfig, submissions: Iterable[SubmissionInfo]) -> list[SubmissionInfo]:
-        self.__cache[task] = self._open_cache_file(task)
         updated_submissions = []
-
-        if self.__cache[task].get("perf_hash") != task.performance_hash():
-            self.log.info("Task configuration changed for %s, regrading all submissions.", task.name)
-            self.__cache[task]["perf_hash"] = task.performance_hash()
-            self.__cache[task]["cache"] = {}
-    
+        
         for submission in submissions:
-            commit_hash = self._get_latest_commit_hash(submission)
-            if self.__cache[task]["cache"].get(submission.repository.html_url) != commit_hash:
-                updated_submissions.append(submission)
-            self.__cache[task]["cache"][submission.repository.html_url] = commit_hash
+            failed_to_get_commit_hash = False
+            try:
+                commit_hash = self._get_latest_commit_hash(submission)
+            except exc.GitCommandError as e:
+                self.log.warning("Failed to get commit hash for submission %s, marking as updated", submission.repository.html_url)
+                failed_to_get_commit_hash = True
 
-        return updated_submissions[:5]
+            if failed_to_get_commit_hash or self.__cache[task]["cache"].get(submission.repository.html_url) != commit_hash:
+                updated_submissions.append(submission)
+
+        return updated_submissions
 
     def _grade_task(self, task: AssignmentTaskConfig, submissions: Iterable[SubmissionInfo]) -> list[TaskGradeResult]:
         task_id = int(os.environ.get('SLURM_PROCID', 0))
@@ -193,7 +208,7 @@ class Grader:
         runtime = sum(runtimes) / len(runtimes) if runtimes else 0.0
         self.log.info("Average runtime for %s [%s]: %.4f ms", submission.repository.full_name, task.name, runtime)
 
-        return {"name": submission.pretty_users, "repo_dir": str(repo_dir), "commit_hash": commit_hash, "status": status, "error": error, "stdout": stdout, "runtimes": runtimes, "data": data}  # Placeholder grade
+        return {"name": submission.pretty_users, "repo_dir": str(repo_dir), "commit_hash": commit_hash, "status": status, "error": error, "stdout": stdout, "runtimes": runtimes, "data": data, "repo_url": submission.repository.html_url}  # Placeholder grade
  
     def _get_result_defaultdict(self) -> dict:
         return defaultdict(
@@ -220,8 +235,12 @@ class Grader:
                 self.log.info("Skipping result retrieval for skipped task: %s[%s]", assignment_cfg.name, task.name)    
                 continue
 
-            task_results: list[TaskGradeResult] = self.runner.collect_results(jobid)
-            self.log.info("Collected results for %s[%s]", assignment_cfg.name, task.name)
+            try:
+                self.log.info("Collecting results for %s[%s]", assignment_cfg.name, task.name)
+                task_results: list[TaskGradeResult] = self.runner.collect_results(jobid)
+            except Exception as e:
+                self.log.error("Failed to collect results for %s[%s]: %s", assignment_cfg.name, task.name, str(e))
+                continue
 
             for result in task_results:
                 name = result["name"]
@@ -230,6 +249,9 @@ class Grader:
                 repo_dir = Path(result["repo_dir"])
                 if not assignment_cfg.preserve_repo_files and repo_dir.exists():
                     repos_to_cleanup.add(repo_dir)
+
+                # Update the cache with the latest commit hash for this student and task
+                self.__cache[task]["cache"][result["repo_url"]] = result["commit_hash"]
 
         # Cleanup repositories
         for repo_dir in repos_to_cleanup:
@@ -266,6 +288,8 @@ class Grader:
         self.jobs = []
 
         for assignment in self.config.assignments:
+            self.log.debug("Loading cache files for assignment: %s", assignment.name)
+            self._open_caches_for_assignment(assignment)
             self.log.info("Launching grading job for assignment: %s", assignment.name)
             self._grade_assignment(assignment)
 
@@ -281,6 +305,5 @@ class Grader:
             commit_sha = pusher.push_results(self.config.grader.grades_file)
             self.log.info("Pushed results to GitHub repository %s at commit %s", self.config.pusher.github_repo, commit_sha)
 
-        for (task, cache) in self.__cache.items():
-            self._save_cache_file(task, cache)
-            self.log.debug("Saved cache for task %s", task.name)
+        for assignment in self.config.assignments:
+            self._save_cache_file_for_assignment(assignment)

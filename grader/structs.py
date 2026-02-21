@@ -5,6 +5,7 @@ class TaskGradeResult(TypedDict):
     name: str
     repo_dir: str
     commit_hash: str
+    repo_url: str
     status: str
     error: str
     stdout: str
@@ -35,6 +36,7 @@ class GradeResult:
             "status": self.status,
             "error": self.error,
             "stdout": self.stdout,
+            "runtimes": self.runtimes,
             "avg_runtime": {task: self.__avg_runtime(task) for task in self.runtimes},
             "data": self.data
         }

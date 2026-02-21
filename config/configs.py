@@ -8,17 +8,22 @@ from os import path
 @dataclass_json
 @dataclass
 class SlurmBackendConfig:
-    config: dict[str, Any] = None
+    config: dict[str, Any]
+    __performance_hash: Optional[str] = None # type: ignore
 
     def assert_valid(self) -> None:
         assert isinstance(self.config, dict), "config must be a dictionary"
 
     def performance_hash(self) -> str:
         # Create a hash based on the config dictionary for performance comparison
+        if self.__performance_hash is not None:
+            return self.__performance_hash
+        
         hasher = hashlib.sha256()
         config_str = str(sorted(self.config.items())) if self.config else ''
         hasher.update(config_str.encode('utf-8'))
-        return hasher.hexdigest()
+        self.__performance_hash = hasher.hexdigest()
+        return self.__performance_hash
 
 @dataclass_json
 @dataclass
@@ -28,6 +33,7 @@ class AssignmentTaskConfig:
     slurm_backend: SlurmBackendConfig
     skip: bool = False
     blocking: bool = False
+    __performance_hash: Optional[str] = None # type: ignore
 
     def assert_valid(self) -> None:
         assert isinstance(self.name, str) and self.name, "name must be a non-empty string"
@@ -40,6 +46,9 @@ class AssignmentTaskConfig:
     def performance_hash(self) -> str:
         # Create a hash based on relevant fields for performance comparison
         # If these fields change, we discard previous cached results
+        if self.__performance_hash is not None:
+            return self.__performance_hash
+        
         hasher = hashlib.sha256()
         hasher.update(self.name.encode('utf-8'))
         hasher.update(self.test_script_path.encode('utf-8'))
@@ -53,7 +62,8 @@ class AssignmentTaskConfig:
 
         # Include slurm_backend config in the hash
         hasher.update(self.slurm_backend.performance_hash().encode('utf-8'))
-        return hasher.hexdigest()
+        self.__performance_hash = hasher.hexdigest()
+        return self.__performance_hash
 
     def __hash__(self) -> int:
         return hash(self.performance_hash())
