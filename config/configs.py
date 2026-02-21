@@ -55,6 +55,9 @@ class AssignmentTaskConfig:
         hasher.update(self.slurm_backend.performance_hash().encode('utf-8'))
         return hasher.hexdigest()
 
+    def __hash__(self) -> int:
+        return hash(self.performance_hash())
+
 @dataclass_json
 @dataclass
 class AssignmentConfig:

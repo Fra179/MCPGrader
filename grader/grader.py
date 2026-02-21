@@ -15,7 +15,7 @@ from logging import Logger
 from runners import *
 from shutil import copyfile
 import subprocess
-from .structs import GradeResult
+from .structs import GradeResult, TaskGradeResult
 from logger import build_logger
 import os
 from pusher.github_pusher import GithubPusher
@@ -104,9 +104,9 @@ class Grader:
                 updated_submissions.append(submission)
             self.__cache[task]["cache"][submission.repository.html_url] = commit_hash
 
-        return updated_submissions
+        return updated_submissions[:5]
 
-    def _grade_task(self, task: AssignmentTaskConfig, submissions: Iterable[SubmissionInfo]) -> list[dict]:
+    def _grade_task(self, task: AssignmentTaskConfig, submissions: Iterable[SubmissionInfo]) -> list[TaskGradeResult]:
         task_id = int(os.environ.get('SLURM_PROCID', 0))
         data = []
 
@@ -126,7 +126,7 @@ class Grader:
 
         return data
            
-    def _grade_submission(self, submission: SubmissionInfo, task: AssignmentTaskConfig, log: Logger) -> dict:
+    def _grade_submission(self, submission: SubmissionInfo, task: AssignmentTaskConfig, log: Logger) -> TaskGradeResult:
         log.info("Grading submission for %s[%s]", submission.repository.full_name, task.name)
         repo_dir = self.wd / (submission.repository.full_name.replace('/', '_') + f"_{task.name}")
         
@@ -134,8 +134,8 @@ class Grader:
             log.info("Cleaning up existing repository directory %s", repo_dir)
             rmtree(repo_dir)
 
+        log.debug("Downloading %s", submission.repository.html_url)
         repo_url = submission.repository.html_url.replace("https://", f"https://{self.pat}@")
-        log.debug("Downloading %s", repo_url)
         repo = Repo.clone_from(repo_url, repo_dir)
 
         commit_hash = repo.head.commit.hexsha
@@ -145,7 +145,7 @@ class Grader:
             
         return result
     
-    def _grade_task_submission(self, task: AssignmentTaskConfig, submission: SubmissionInfo, commit_hash: str, repo_dir: Path) -> dict:
+    def _grade_task_submission(self, task: AssignmentTaskConfig, submission: SubmissionInfo, commit_hash: str, repo_dir: Path) -> TaskGradeResult:
         # Use slurm to run the grading script
         # Copy the grading script to the repo directory
 
@@ -198,47 +198,48 @@ class Grader:
     def _get_result_defaultdict(self) -> dict:
         return defaultdict(
             lambda: defaultdict(
-                lambda: GradeResult("", "", {}, {}, {}, {}, {})
+                lambda: GradeResult("", {}, {}, {}, {}, {}, {})
                 )
             )
                 
     def _retrieve_results(self, existing_data: dict) -> dict:
-        data: dict[str, dict[str, GradeResult]] = self._get_result_defaultdict()
-        
+        data: dict[tuple[str, str], GradeResult] = defaultdict(lambda: GradeResult("", {}, {}, {}, {}, {}, {}))
+
         repos_to_cleanup = set()
+
+
+        # compute the students to keep because they were not re-graded
+        # data_to_add: dict[tuple[str, str, str], GradeResult] = defaultdict(lambda: GradeResult("", "", {}, {}, {}, {}, {}))
+
+        for assignment_name, students in existing_data.items():
+            for student in students:
+                data[(assignment_name, student["name"])] = GradeResult.from_dict(student)
 
         for assignment_cfg, task, jobid in self.job_ids:
             if jobid is None:
                 self.log.info("Skipping result retrieval for skipped task: %s[%s]", assignment_cfg.name, task.name)    
                 continue
 
-            task_results = self.runner.collect_results(jobid)
+            task_results: list[TaskGradeResult] = self.runner.collect_results(jobid)
             self.log.info("Collected results for %s[%s]", assignment_cfg.name, task.name)
 
             for result in task_results:
                 name = result["name"]
-                data[assignment_cfg.name][name].update_from_dict(result, task.name)
+                data[(assignment_cfg.name, name)].update_from_dict(result, task.name)
             
                 repo_dir = Path(result["repo_dir"])
                 if not assignment_cfg.preserve_repo_files and repo_dir.exists():
                     repos_to_cleanup.add(repo_dir)
 
-        result = existing_data
-
-        # compute the students to keep because they were not re-graded
-        to_add = defaultdict(list)
-
-        for assignment_name, students in existing_data.items():
-            to_add[assignment_name].extend([student for student in students if student["name"] not in data[assignment_name]]) 
-
-        # when updating the data, don't forget to add the non-updated students
-        for assignment_name, students in data.items():
-            result[assignment_name] = [student.to_dict() for student in students.values()] + to_add[assignment_name]
-
         # Cleanup repositories
         for repo_dir in repos_to_cleanup:
             rmtree(repo_dir, ignore_errors=True)
             self.log.debug("Deleted repository files for %s", repo_dir.name.replace('_', '/'))
+
+        result = defaultdict(list)
+
+        for (assignment_name, _), grade_result in data.items():
+            result[assignment_name].append(grade_result.to_dict())
         
         return result
 
