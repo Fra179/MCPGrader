@@ -4,6 +4,7 @@ from typing import List, Optional, Any
 import hashlib
 import os
 from os import path
+from aggregation import AGG_NAME_TO_CLASS
 
 @dataclass_json
 @dataclass
@@ -33,6 +34,7 @@ class AssignmentTaskConfig:
     slurm_backend: SlurmBackendConfig
     skip: bool = False
     blocking: bool = False
+    aggregation_method: Optional[str] = None
     __performance_hash: Optional[str] = None # type: ignore
 
     def assert_valid(self) -> None:
@@ -42,6 +44,9 @@ class AssignmentTaskConfig:
         self.slurm_backend.assert_valid()
         assert isinstance(self.skip, bool), "skip must be a boolean"
         assert isinstance(self.blocking, bool), "blocking must be a boolean"
+        assert self.aggregation_method is None or isinstance(self.aggregation_method, str), "aggregation_method must be a string or None"
+        if self.aggregation_method is not None:
+            assert self.aggregation_method in AGG_NAME_TO_CLASS, f"aggregation_method {self.aggregation_method} is not supported"
 
     def performance_hash(self) -> str:
         # Create a hash based on relevant fields for performance comparison
@@ -62,6 +67,8 @@ class AssignmentTaskConfig:
 
         # Include slurm_backend config in the hash
         hasher.update(self.slurm_backend.performance_hash().encode('utf-8'))
+        # Include aggregation_method in the hash
+        hasher.update((self.aggregation_method or "").encode('utf-8'))
         self.__performance_hash = hasher.hexdigest()
         return self.__performance_hash
 
@@ -72,11 +79,11 @@ class AssignmentTaskConfig:
 @dataclass
 class AssignmentConfig:
     name: str
+    tasks: List[AssignmentTaskConfig]
     invite_link: Optional[str] = None
     slug: Optional[str] = None
     id: Optional[int] = None
     preserve_repo_files: bool = False
-    tasks: List[AssignmentTaskConfig] = None
 
 
     def assert_valid(self) -> None:

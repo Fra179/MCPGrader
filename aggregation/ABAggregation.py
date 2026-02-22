@@ -1,7 +1,7 @@
 from abc import ABC, abstractmethod
-from typing import Any
+from typing import Any, TypeVar
 
-class ABAggregation(ABC):
+class ABAggregation[T](ABC):
     @classmethod
     @abstractmethod
     def name(cls) -> str:
@@ -18,5 +18,5 @@ class ABAggregation(ABC):
         pass
 
     @abstractmethod
-    def aggregate(self, data: list[Any]) -> dict[str, Any]:
+    def aggregate(self, data: list[T]) -> T:
         pass

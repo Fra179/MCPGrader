@@ -3,6 +3,7 @@ import json
 from typing import Any, Iterable
 from config import ProgramConfig, AssignmentConfig, AssignmentTaskConfig
 from git import Repo, Git, exc
+from aggregation import AGG_NAME_TO_CLASS
 from gh import GithubClassroomAPI
 from gh.filters import By
 from gh.exceptions import GitHubException
@@ -37,47 +38,11 @@ class Grader:
         if not (self.wd / ".cache").exists():
             mkdir(self.wd / ".cache")
 
-    def _get_assignment(self, assignment_cfg: AssignmentConfig):
-        if assignment_cfg.invite_link:
-            assignment = self.classroom.get_assignment_by(By.INVITE_LINK, assignment_cfg.invite_link)
-        elif assignment_cfg.slug:
-            assignment = self.classroom.get_assignment_by(By.SLUG, assignment_cfg.slug)
-        elif assignment_cfg.id:
-            assignment = self.classroom.get_assignment_by(By.ID, assignment_cfg.id)
-        else:
-            raise GitHubException("No valid identifier provided for assignment.")
-        
-        return assignment
-    
+
     def _open_caches_for_assignment(self, assignment_cfg: AssignmentConfig) -> None:
         for task in assignment_cfg.tasks:
             self.__cache[task] = self._open_cache_file(task, assignment_cfg)
 
-    def _grade_assignment(self, assignment_cfg: AssignmentConfig) -> None:
-        assignment = self._get_assignment(assignment_cfg)
-        submissions = self.classroom.get_submissions_for_assignment(assignment.id)
-
-        for task in assignment_cfg.tasks:
-            blocking = task.blocking
-
-            if task.skip:
-                self.log.info("Skipping grading for task: %s[%s]", assignment_cfg.name, task.name)
-                self.job_ids.append((assignment_cfg, task, None))
-                continue
-            
-            self.log.info("Launching grading job for task: %s[%s]", assignment_cfg.name, task.name)
-            job_id = self.runner.run(self._grade_task, task, submissions)
-            self.job_ids.append((assignment_cfg, task, job_id))
-
-            if blocking:
-                self.log.info("Waiting for blocking task %s[%s] to complete", assignment_cfg.name, task.name)
-                self.runner.wait(job_id)
-
-    def _get_latest_commit_hash(self, submission: SubmissionInfo) -> str:
-        repo_url = submission.repository.html_url.replace("https://", f"https://{self.pat}@")
-        commit_hash = self.git.ls_remote(repo_url, "HEAD").split()[0]
-        return commit_hash
-    
     def _open_cache_file(self, task: AssignmentTaskConfig, assignment: AssignmentConfig) -> dict[str, Any]:
         cache_file_path = self.wd / ".cache" / f"{assignment.name}_{task.name}_cache.json"
         if not cache_file_path.exists():
@@ -104,6 +69,43 @@ class Grader:
             if cache is not None:
                 self._save_cache_file(task, assignment, cache)
                 self.log.debug("Saved cache for task %s[%s]", assignment.name, task.name)
+
+    def _get_assignment(self, assignment_cfg: AssignmentConfig):
+        if assignment_cfg.invite_link:
+            assignment = self.classroom.get_assignment_by(By.INVITE_LINK, assignment_cfg.invite_link)
+        elif assignment_cfg.slug:
+            assignment = self.classroom.get_assignment_by(By.SLUG, assignment_cfg.slug)
+        elif assignment_cfg.id:
+            assignment = self.classroom.get_assignment_by(By.ID, assignment_cfg.id)
+        else:
+            raise GitHubException("No valid identifier provided for assignment.")
+        
+        return assignment
+
+    def _grade_assignment(self, assignment_cfg: AssignmentConfig) -> None:
+        assignment = self._get_assignment(assignment_cfg)
+        submissions = self.classroom.get_submissions_for_assignment(assignment.id)
+
+        for task in assignment_cfg.tasks:
+            blocking = task.blocking
+
+            if task.skip:
+                self.log.info("Skipping grading for task: %s[%s]", assignment_cfg.name, task.name)
+                self.job_ids.append((assignment_cfg, task, None))
+                continue
+            
+            self.log.info("Launching grading job for task: %s[%s]", assignment_cfg.name, task.name)
+            job_id = self.runner.run(self._grade_task, task, submissions)
+            self.job_ids.append((assignment_cfg, task, job_id))
+
+            if blocking:
+                self.log.info("Waiting for blocking task %s[%s] to complete", assignment_cfg.name, task.name)
+                self.runner.wait(job_id)
+
+    def _get_latest_commit_hash(self, submission: SubmissionInfo) -> str:
+        repo_url = submission.repository.html_url.replace("https://", f"https://{self.pat}@")
+        commit_hash = self.git.ls_remote(repo_url, "HEAD").split()[0]
+        return commit_hash
 
     def _filter_updated_submissions(self, task: AssignmentTaskConfig, submissions: Iterable[SubmissionInfo]) -> list[SubmissionInfo]:
         updated_submissions = []
@@ -175,7 +177,7 @@ class Grader:
         # Run inside the slurm environment, pipe stdout to a variable
         self.log.info("Running grading script")
         
-        data = None
+        data = {}
         error = ""
         status = ""
         stdout = ""
@@ -208,17 +210,21 @@ class Grader:
         runtime = sum(runtimes) / len(runtimes) if runtimes else 0.0
         self.log.info("Average runtime for %s [%s]: %.4f ms", submission.repository.full_name, task.name, runtime)
 
-        return {"name": submission.pretty_users, "repo_dir": str(repo_dir), "commit_hash": commit_hash, "status": status, "error": error, "stdout": stdout, "runtimes": runtimes, "data": data, "repo_url": submission.repository.html_url}  # Placeholder grade
- 
-    def _get_result_defaultdict(self) -> dict:
-        return defaultdict(
-            lambda: defaultdict(
-                lambda: GradeResult("", {}, {}, {}, {}, {}, {})
-                )
-            )
+        return {
+            "name": submission.pretty_users, 
+            "repo_dir": str(repo_dir), 
+            "commit_hash": commit_hash, 
+            "status": status, 
+            "error": error, 
+            "stdout": stdout, 
+            "runtimes": runtimes, 
+            "data": data, 
+            "repo_url": submission.repository.html_url,
+            "aggregation_function": AGG_NAME_TO_CLASS[task.aggregation_method or "mean"](),
+        }  # Placeholder grade
                 
     def _retrieve_results(self, existing_data: dict) -> dict:
-        data: dict[tuple[str, str], GradeResult] = defaultdict(lambda: GradeResult("", {}, {}, {}, {}, {}, {}))
+        data: dict[tuple[str, str], GradeResult] = defaultdict(lambda: GradeResult("", {}, {}, {}, {}, {}, {}, {}))
 
         repos_to_cleanup = set()
 

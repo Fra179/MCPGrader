@@ -1,6 +1,6 @@
 from .ABAggregation import ABAggregation
 
-class MeanAggregation(ABAggregation):
+class MeanAggregation(ABAggregation[float]):
     @classmethod
     def name(cls) -> str:
         return "mean"
@@ -13,13 +13,12 @@ class MeanAggregation(ABAggregation):
     def compatible_with(cls) -> list[type]:
         return [float, int]
 
-    def aggregate(self, data: list[float]) -> dict[str, float]:
+    def aggregate(self, data: list[float]) -> float:
         if not data:
-            return {"mean": 0.0}
-        mean_value = sum(data) / len(data)
-        return {"mean": mean_value}
+            return 0.0
+        return sum(data) / len(data)
     
-class MedianAggregation(ABAggregation):
+class MedianAggregation(ABAggregation[float]):
     @classmethod
     def name(cls) -> str:
         return "median"
@@ -32,10 +31,9 @@ class MedianAggregation(ABAggregation):
     def compatible_with(cls) -> list[type]:
         return [float, int]
 
-    def aggregate(self, data: list[float]) -> dict[str, float]:
+    def aggregate(self, data: list[float]) -> float:
         if not data:
-            return {"median": 0.0}
+            return 0.0
         sorted_data = sorted(data)
         n = len(sorted_data)
-        median_value = (sorted_data[n // 2] if n % 2 == 1 else (sorted_data[n // 2 - 1] + sorted_data[n // 2]) / 2)
-        return {"median": median_value}
+        return (sorted_data[n // 2] if n % 2 == 1 else (sorted_data[n // 2 - 1] + sorted_data[n // 2]) / 2)

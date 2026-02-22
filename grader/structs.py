@@ -1,5 +1,7 @@
 from dataclasses import dataclass
 from typing import Any, TypedDict
+from aggregation import AGG_NAME_TO_CLASS
+from aggregation.ABAggregation import ABAggregation
 
 class TaskGradeResult(TypedDict):
     name: str
@@ -11,6 +13,7 @@ class TaskGradeResult(TypedDict):
     stdout: str
     runtimes: list[float]
     data: dict[str, Any] | None
+    aggregation_function: ABAggregation
 
 @dataclass
 class GradeResult:
@@ -21,10 +24,14 @@ class GradeResult:
     stdout: dict[str, str]
     runtimes: dict[str, list[float]]
     data: dict[str, dict]
+    aggregation_functions: dict[str, ABAggregation]
 
     def __avg_runtime(self, task_name: str) -> float:
         times = self.runtimes.get(task_name, [])
-        if not times:
+        agg_func = self.aggregation_functions.get(task_name)
+        if agg_func:
+            return agg_func.aggregate(times)
+        elif not times:
             return 0.0
         return sum(times) / len(times)
 
@@ -38,7 +45,8 @@ class GradeResult:
             "stdout": self.stdout,
             "runtimes": self.runtimes,
             "avg_runtime": {task: self.__avg_runtime(task) for task in self.runtimes},
-            "data": self.data
+            "data": self.data,
+            "aggregation_functions": {task: agg.name() for task, agg in self.aggregation_functions.items()}
         }
     
     @staticmethod
@@ -50,7 +58,8 @@ class GradeResult:
             error=info.get("error", {}),
             stdout=info.get("stdout", {}),
             runtimes=info.get("runtimes", {}),
-            data=info.get("data", {})
+            data=info.get("data", {}),
+            aggregation_functions={task: AGG_NAME_TO_CLASS[agg_name]() for task, agg_name in info.get("aggregation_functions", {}).items()}  
         )
     
     def update_from_dict(self, info: TaskGradeResult, task_name: str) -> None:
@@ -60,19 +69,6 @@ class GradeResult:
         self.error[task_name] = info.get("error", "Unknown error")
         self.stdout[task_name] = info.get("stdout", "")
         self.runtimes[task_name] = info.get("runtimes", [])
-        self.data[task_name] = info.get("data", {})
-
-    def __add__(self, other: "GradeResult") -> "GradeResult":
-        if self.name != other.name:
-            raise ValueError("Cannot add GradeResults with different names")
-        
-        merged = GradeResult(
-            name=self.name,
-            commit_hash={**self.commit_hash, **other.commit_hash},
-            status={**self.status, **other.status},
-            error={**self.error, **other.error},
-            stdout={**self.stdout, **other.stdout},
-            runtimes={**self.runtimes, **other.runtimes},
-            data={**self.data, **other.data}
-        )
-        return merged
+        data_val = info.get("data")
+        self.data[task_name] = data_val if data_val is not None else {}
+        self.aggregation_functions[task_name] = info.get("aggregation_function", None)
