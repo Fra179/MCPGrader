@@ -220,7 +220,7 @@ class Grader:
             "runtimes": runtimes, 
             "data": data, 
             "repo_url": submission.repository.html_url,
-            "aggregation_function": AGG_NAME_TO_CLASS[task.aggregation_method or "mean"](),
+            "reduction": AGG_NAME_TO_CLASS[task.reduction or "mean"](),
         }  # Placeholder grade
                 
     def _retrieve_results(self, existing_data: dict) -> dict:

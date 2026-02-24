@@ -34,7 +34,7 @@ class AssignmentTaskConfig:
     slurm_backend: SlurmBackendConfig
     skip: bool = False
     blocking: bool = False
-    aggregation_method: Optional[str] = None
+    reduction: Optional[str] = None
     __performance_hash: Optional[str] = None # type: ignore
 
     def assert_valid(self) -> None:
@@ -44,9 +44,9 @@ class AssignmentTaskConfig:
         self.slurm_backend.assert_valid()
         assert isinstance(self.skip, bool), "skip must be a boolean"
         assert isinstance(self.blocking, bool), "blocking must be a boolean"
-        assert self.aggregation_method is None or isinstance(self.aggregation_method, str), "aggregation_method must be a string or None"
-        if self.aggregation_method is not None:
-            assert self.aggregation_method in AGG_NAME_TO_CLASS, f"aggregation_method {self.aggregation_method} is not supported"
+        assert self.reduction is None or isinstance(self.reduction, str), "reduction must be a string or None"
+        if self.reduction is not None:
+            assert self.reduction in AGG_NAME_TO_CLASS, f"reduction {self.reduction} is not supported"
 
     def performance_hash(self) -> str:
         # Create a hash based on relevant fields for performance comparison
@@ -67,8 +67,8 @@ class AssignmentTaskConfig:
 
         # Include slurm_backend config in the hash
         hasher.update(self.slurm_backend.performance_hash().encode('utf-8'))
-        # Include aggregation_method in the hash
-        hasher.update((self.aggregation_method or "").encode('utf-8'))
+        # Include reduction in the hash
+        hasher.update((self.reduction or "").encode('utf-8'))
         self.__performance_hash = hasher.hexdigest()
         return self.__performance_hash
 
