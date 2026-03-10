@@ -14,11 +14,12 @@ class SlurmRunner(ABRunner):
         self.job_idx = 0
 
     def run(self, grading_function: Callable[[AssignmentTaskConfig, ...]], task: AssignmentTaskConfig, *args, **kwargs) -> int:
-        if not task.slurm_backend.config.get("slurm_job_name"):
-            task.slurm_backend.config["slurm_job_name"] = f"grading_{task.name}"
+        config = task.slurm_backend.config.copy() 
 
-        config = task.slurm_backend.config
-        config["slurm_use_srun"] = False  # We are already running inside a SLURM job\
+        if not config.get("slurm_job_name"):
+            config["slurm_job_name"] = f"grading_{task.name}"
+
+        config["slurm_use_srun"] = False  # We are already running inside a SLURM job
 
         self.executor.update_parameters(**config)
         job: Job = self.executor.submit(grading_function, *[task] + list(args), **kwargs)

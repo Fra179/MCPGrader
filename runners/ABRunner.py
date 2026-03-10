@@ -1,5 +1,6 @@
 from abc import ABC, abstractmethod
 from config.configs import AssignmentTaskConfig
+from grader.structs import TaskGradeResult
 
 class ABRunner(ABC):
     @abstractmethod
@@ -15,5 +16,5 @@ class ABRunner(ABC):
         raise NotImplementedError()
 
     @abstractmethod
-    def collect_results(self, jobid: int) -> dict:
+    def collect_results(self, jobid: int) -> list[TaskGradeResult]:
         raise NotImplementedError()

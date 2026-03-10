@@ -4,21 +4,27 @@ from typing import List, Optional, Any
 import hashlib
 import os
 from os import path
+from aggregation import AGG_NAME_TO_CLASS
 
 @dataclass_json
 @dataclass
 class SlurmBackendConfig:
-    config: dict[str, Any] = None
+    config: dict[str, Any]
+    __performance_hash: Optional[str] = None # type: ignore
 
     def assert_valid(self) -> None:
         assert isinstance(self.config, dict), "config must be a dictionary"
 
     def performance_hash(self) -> str:
         # Create a hash based on the config dictionary for performance comparison
+        if self.__performance_hash is not None:
+            return self.__performance_hash
+        
         hasher = hashlib.sha256()
         config_str = str(sorted(self.config.items())) if self.config else ''
         hasher.update(config_str.encode('utf-8'))
-        return hasher.hexdigest()
+        self.__performance_hash = hasher.hexdigest()
+        return self.__performance_hash
 
 @dataclass_json
 @dataclass
@@ -28,6 +34,8 @@ class AssignmentTaskConfig:
     slurm_backend: SlurmBackendConfig
     skip: bool = False
     blocking: bool = False
+    reduction: Optional[str] = None
+    __performance_hash: Optional[str] = None # type: ignore
 
     def assert_valid(self) -> None:
         assert isinstance(self.name, str) and self.name, "name must be a non-empty string"
@@ -36,10 +44,16 @@ class AssignmentTaskConfig:
         self.slurm_backend.assert_valid()
         assert isinstance(self.skip, bool), "skip must be a boolean"
         assert isinstance(self.blocking, bool), "blocking must be a boolean"
+        assert self.reduction is None or isinstance(self.reduction, str), "reduction must be a string or None"
+        if self.reduction is not None:
+            assert self.reduction in AGG_NAME_TO_CLASS, f"reduction {self.reduction} is not supported"
 
     def performance_hash(self) -> str:
         # Create a hash based on relevant fields for performance comparison
         # If these fields change, we discard previous cached results
+        if self.__performance_hash is not None:
+            return self.__performance_hash
+        
         hasher = hashlib.sha256()
         hasher.update(self.name.encode('utf-8'))
         hasher.update(self.test_script_path.encode('utf-8'))
@@ -53,17 +67,23 @@ class AssignmentTaskConfig:
 
         # Include slurm_backend config in the hash
         hasher.update(self.slurm_backend.performance_hash().encode('utf-8'))
-        return hasher.hexdigest()
+        # Include reduction in the hash
+        hasher.update((self.reduction or "").encode('utf-8'))
+        self.__performance_hash = hasher.hexdigest()
+        return self.__performance_hash
+
+    def __hash__(self) -> int:
+        return hash(self.performance_hash())
 
 @dataclass_json
 @dataclass
 class AssignmentConfig:
     name: str
+    tasks: List[AssignmentTaskConfig]
     invite_link: Optional[str] = None
     slug: Optional[str] = None
     id: Optional[int] = None
     preserve_repo_files: bool = False
-    tasks: List[AssignmentTaskConfig] = None
 
 
     def assert_valid(self) -> None:
