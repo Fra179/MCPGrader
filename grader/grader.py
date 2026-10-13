@@ -11,6 +11,7 @@ from logging import Logger
 from runners import *
 from shutil import copyfile
 import subprocess
+import signal
 from .structs import GradeResult, TaskGradeResult
 from logger import build_logger
 import os
@@ -19,6 +20,8 @@ from grader_worker import GraderWorkerAPI, SubmissionInfo
 import shlex
 import tempfile
 from contextlib import contextmanager
+
+KILL_GRACE_SECONDS = 5  # how long a timed-out test script gets after each kill signal
 
 @contextmanager
 def deploy_key_env(deploy_key: str):
@@ -83,6 +86,8 @@ class Grader:
         submissions = worker.get_submissions(assignment_cfg.name)
         self.log.info("Found %d submissions for assignment %s", len(submissions), assignment_cfg.name)
 
+        commit_hashes = self._get_latest_commit_hashes(submissions) if any(not task.skip for task in assignment_cfg.tasks) else {}
+
         for task in assignment_cfg.tasks:
             blocking = task.blocking
 
@@ -90,11 +95,21 @@ class Grader:
                 self.log.info("Skipping grading for task: %s[%s]", assignment_cfg.name, task.name)
                 self.job_ids.append((assignment_cfg, task, None))
                 continue
-            
-            self.log.info("Launching grading job for task: %s[%s]", assignment_cfg.name, task.name)
+
+            updated_submissions = self._filter_updated_submissions(task, submissions, commit_hashes)
+            if not updated_submissions:
+                self.log.info("No updated submissions for task %s[%s], not launching a job", assignment_cfg.name, task.name)
+                continue
+
+            # Clear results left by a previous run, so only this run's job is read back
+            results_dir = self._results_dir(assignment_cfg, task)
+            rmtree(results_dir, ignore_errors=True)
+            results_dir.mkdir(parents=True)
+
+            self.log.info("Launching grading job for task %s[%s] with %d updated submissions", assignment_cfg.name, task.name, len(updated_submissions))
             # TODO: submitit pickles the arguments (including every student's deploy_key) into
             # <working_dir>/slurm_logs/*_submitted.pkl and never deletes them, so the keys stay on disk.
-            job_id = self.runner.run(self._grade_task, task, submissions)
+            job_id = self.runner.run(self._grade_task, task, updated_submissions, results_dir)
             self.job_ids.append((assignment_cfg, task, job_id))
 
             if blocking:
@@ -110,47 +125,71 @@ class Grader:
             with git.custom_environment(**env):
                 return git.ls_remote(submission.ssh_url, "HEAD").split()[0]
 
-    def _filter_updated_submissions(self, task: AssignmentTaskConfig, submissions: Iterable[SubmissionInfo], log: Logger) -> list[SubmissionInfo]:
-        updated_submissions = []
-        
-        for submission in submissions:
-            failed_to_get_commit_hash = False
-            empty = False
+    def _get_latest_commit_hashes(self, submissions: Iterable[SubmissionInfo]) -> dict[str, str | None]:
+        """HEAD commit of each non-empty submission, keyed by ssh_url; None if it couldn't be fetched."""
+        commit_hashes: dict[str, str | None] = {}
 
+        for submission in submissions:
             try:
-                commit_hash = self._get_latest_commit_hash(submission)
-            except exc.GitCommandError as e:
-                log.warning("Failed to get commit hash for submission %s, marking as updated", submission.repo_url)
-                failed_to_get_commit_hash = True
-            except IndexError as e:
-                empty = True
-            
-            if empty:
-                log.info("Submission %s has no commits, skipping grading", submission.repo_url)
+                commit_hashes[submission.ssh_url] = self._get_latest_commit_hash(submission)
+            except exc.GitCommandError:
+                self.log.warning("Failed to get commit hash for submission %s, marking as updated", submission.repo_url)
+                commit_hashes[submission.ssh_url] = None
+            except IndexError:
+                self.log.info("Submission %s has no commits, skipping grading", submission.repo_url)
+
+        return commit_hashes
+
+    def _filter_updated_submissions(self, task: AssignmentTaskConfig, submissions: Iterable[SubmissionInfo], commit_hashes: dict[str, str | None]) -> list[SubmissionInfo]:
+        cache = self.__cache[task]["cache"]
+        updated_submissions = []
+
+        for submission in submissions:
+            if submission.ssh_url not in commit_hashes:  # empty repository
                 continue
 
-            if failed_to_get_commit_hash or self.__cache[task]["cache"].get(submission.ssh_url) != commit_hash:
+            commit_hash = commit_hashes[submission.ssh_url]
+            if commit_hash is None or cache.get(submission.ssh_url) != commit_hash:
                 updated_submissions.append(submission)
 
         return updated_submissions
 
-    def _grade_task(self, task: AssignmentTaskConfig, submissions: Iterable[SubmissionInfo]) -> list[TaskGradeResult]:
+    def _results_dir(self, assignment: AssignmentConfig, task: AssignmentTaskConfig) -> Path:
+        return self.wd / "results" / assignment.name / task.name
+
+    def _grade_task(self, task: AssignmentTaskConfig, submissions: Iterable[SubmissionInfo], results_dir: Path) -> None:
+        # Each result is written to results_dir as soon as it's ready, so if the job dies
+        # only the submission being graded at that moment is lost
         task_id = int(os.environ.get('SLURM_PROCID', 0))
-        data = []
 
         if task_id != 0:
-            return []
+            return
 
         logger = build_logger(name=f"grader.task.{task.name}", level=self.log.level)
 
-        for submission in self._filter_updated_submissions(task, submissions, logger):
+        for submission in submissions:
             try:
                 res = self._grade_submission(submission, task, logger)
-                data.append(res)
+                self._write_result(results_dir, res)
             except Exception as e:
                 logger.error("Failed to grade submission %s[%s]: %s", submission.repo_url, task.name, str(e))
 
-        return data
+    def _write_result(self, results_dir: Path, result: TaskGradeResult) -> None:
+        result_path = results_dir / f"{result['name']}.json"
+        tmp_path = result_path.with_suffix(".json.tmp")
+        with open(tmp_path, 'w') as f:
+            json.dump(result, f)
+        os.replace(tmp_path, result_path)  # atomic, so a partially written result is never read
+
+    def _read_results(self, results_dir: Path) -> list[TaskGradeResult]:
+        results = []
+        for result_path in sorted(results_dir.glob("*.json")):
+            try:
+                with open(result_path, 'r') as f:
+                    results.append(json.load(f))
+            except (OSError, json.JSONDecodeError) as e:
+                self.log.error("Failed to read result file %s: %s", result_path, str(e))
+        return results
            
     def _grade_submission(self, submission: SubmissionInfo, task: AssignmentTaskConfig, log: Logger) -> TaskGradeResult:
         full_name = self._repo_full_name(submission)
@@ -193,11 +232,19 @@ class Grader:
         stdout = ""
         runtimes = []
         
-        try:
-            result = subprocess.run([grading_script_dest], cwd=repo_dir, capture_output=True, text=True, check=True)
-            result.stdout = result.stdout.strip()
-            stdout = result.stdout
-            last_line = result.stdout.split('\n')[-1]
+        returncode, stdout, stderr = self._run_test_script(grading_script_dest, repo_dir, task.submission_timeout, log)
+
+        if returncode is None:
+            log.error("Grading script timed out after %ss", task.submission_timeout)
+            error = f"Grading script timed out after {task.submission_timeout}s\n" + stderr
+            status = "timeout"
+        elif returncode != 0:
+            log.error("Grading script failed with error: %s", stderr)
+            error = stderr
+            status = "error"
+        else:
+            stdout = stdout.strip()
+            last_line = stdout.split('\n')[-1]
 
             # {'passed': 12, 'total': 12, 'times': [442.44458, 664.421387, 886.576111, 354.137085, 442.864655, 663.164917, 884.586487, 354.348022, 443.62854, 664.1828, 885.255188, 354.565033]}
             try:
@@ -207,15 +254,10 @@ class Grader:
             except json.JSONDecodeError:
                 log.error("Failed to parse grading script output as JSON: %s", last_line)
                 status = "error"
-                error = "Failed to parse grading script output as JSON. The script may have crashed or produced invalid output.\nLast line: " + last_line +  "\nFull stderr:\n" + result.stderr
+                error = "Failed to parse grading script output as JSON. The script may have crashed or produced invalid output.\nLast line: " + last_line +  "\nFull stderr:\n" + stderr
 
             log.info("Grading result: %s", data)
-            log.info("Grading script output: %s", result.stdout)
-        except subprocess.CalledProcessError as e:
-            log.error("Grading script failed with error: %s", e.stderr)
-            error = e.stderr
-            stdout = e.stdout
-            status = "error"
+            log.info("Grading script output: %s", stdout)
 
         runtime = sum(runtimes) / len(runtimes) if runtimes else 0.0
         log.info("Average runtime for %s [%s]: %.4f ms", submission.repo_url, task.name, runtime)
@@ -230,9 +272,38 @@ class Grader:
             "runtimes": runtimes, 
             "data": data, 
             "repo_url": submission.ssh_url,
-            "reduction": AGG_NAME_TO_CLASS[task.reduction or "mean"](),
-        }  # Placeholder grade
-                
+        }
+
+    def _run_test_script(self, script: Path, cwd: Path, timeout: int | None, log: Logger) -> tuple[int | None, str, str]:
+        """Run the test script in its own process group. Returns (returncode, stdout, stderr); returncode is None on timeout."""
+        process = subprocess.Popen([script], cwd=cwd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, start_new_session=True)
+        try:
+            stdout, stderr = process.communicate(timeout=timeout)
+            return process.returncode, stdout, stderr
+        except subprocess.TimeoutExpired:
+            pass
+
+        # Kill the whole group, not just the script: make, srun and the student's binary would
+        # otherwise keep running and hold the output pipes open. SIGTERM first lets srun clean up.
+        for sig in (signal.SIGTERM, signal.SIGKILL):
+            try:
+                os.killpg(process.pid, sig)
+            except ProcessLookupError:
+                pass
+            try:
+                stdout, stderr = process.communicate(timeout=KILL_GRACE_SECONDS)
+                return None, stdout, stderr
+            except subprocess.TimeoutExpired:
+                continue
+
+        # Something that left the process group still holds the pipes: give up on the output
+        log.warning("Processes of %s survived SIGKILL of their group, discarding their output", script)
+        for pipe in (process.stdout, process.stderr):
+            if pipe:
+                pipe.close()
+        process.wait()
+        return None, "", ""
+
     def _retrieve_results(self, existing_data: dict) -> dict:
         data: dict[tuple[str, str], GradeResult] = defaultdict(lambda: GradeResult("", {}, {}, {}, {}, {}, {}, {}))
 
@@ -251,16 +322,15 @@ class Grader:
                 self.log.info("Skipping result retrieval for skipped task: %s[%s]", assignment_cfg.name, task.name)    
                 continue
 
+            self.log.info("Collecting results for %s[%s]", assignment_cfg.name, task.name)
             try:
-                self.log.info("Collecting results for %s[%s]", assignment_cfg.name, task.name)
-                task_results: list[TaskGradeResult] = self.runner.collect_results(jobid)
+                self.runner.collect_results(jobid)  # only to surface a job failure
             except Exception as e:
-                self.log.error("Failed to collect results for %s[%s]: %s", assignment_cfg.name, task.name, str(e))
-                continue
+                self.log.error("Grading job for %s[%s] failed, keeping the results it wrote before failing: %s", assignment_cfg.name, task.name, str(e))
 
-            for result in task_results:
+            for result in self._read_results(self._results_dir(assignment_cfg, task)):
                 name = result["name"]
-                data[(assignment_cfg.name, name)].update_from_dict(result, task.name)
+                data[(assignment_cfg.name, name)].update_from_dict(result, task.name, AGG_NAME_TO_CLASS[task.reduction or "mean"]())
             
                 repo_dir = Path(result["repo_dir"])
                 if not assignment_cfg.preserve_repo_files and repo_dir.exists():

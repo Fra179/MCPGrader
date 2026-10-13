@@ -35,6 +35,7 @@ assignments:
         skip: false
         blocking: true
         test_script_path: "./test_scripts/test_vectorsum_gpu.sh"
+        submission_timeout: 300 # seconds per student; omit for no limit
         slurm_backend:
           config:
             slurm_partition: "gpu"

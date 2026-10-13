@@ -13,7 +13,6 @@ class TaskGradeResult(TypedDict):
     stdout: str
     runtimes: list[float]
     data: dict[str, Any] | None
-    reduction: ABAggregation
 
 @dataclass
 class GradeResult:
@@ -62,7 +61,7 @@ class GradeResult:
             reduction={task: AGG_NAME_TO_CLASS[agg_name]() for task, agg_name in info.get("reduction", {}).items()}  
         )
     
-    def update_from_dict(self, info: TaskGradeResult, task_name: str) -> None:
+    def update_from_dict(self, info: TaskGradeResult, task_name: str, reduction: ABAggregation) -> None:
         self.name = info.get("name", self.name)
         self.commit_hash[task_name] = info.get("commit_hash", "unknown")
         self.status[task_name] = info.get("status", "error")
@@ -71,4 +70,4 @@ class GradeResult:
         self.runtimes[task_name] = info.get("runtimes", [])
         data_val = info.get("data")
         self.data[task_name] = data_val if data_val is not None else {}
-        self.reduction[task_name] = info.get("reduction", None)
+        self.reduction[task_name] = reduction

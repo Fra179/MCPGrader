@@ -170,6 +170,8 @@ assignments:
 
 - **`test_script_path`** (required): Absolute or relative path to the test script that will be executed in each student's repository for this task.
 
+- **`submission_timeout`** (default: no limit): Seconds a single student's test script may run. On timeout the script's whole process group (including `make`, `srun` and the student's program) gets SIGTERM, then SIGKILL 5 s later, and the result is recorded with status `timeout`. All of a task's submissions are graded one after another in a single SLURM job, so `timeout_min` should cover the number of updated submissions times this value.
+
 >### [!] Important [!]
 >When writing your test script don't forget to launch the student's script with either `srun`, `mpirun` or a similar command that will also schedule the process on the cluster!
 
