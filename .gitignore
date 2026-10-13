@@ -286,3 +286,4 @@ test_scripts/*.sh
 *.json
 *.lock
 keys/
+results/
