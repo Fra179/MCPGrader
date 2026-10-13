@@ -5,6 +5,7 @@ from config.configs import AssignmentTaskConfig
 class ABRunner(ABC):
     @abstractmethod
     def run(self, grading_function: Callable[..., Any], task: AssignmentTaskConfig, *args, **kwargs) -> int:
+        """Submit grading_function(*args, **kwargs) as a job; task only supplies its scheduling parameters."""
         raise NotImplementedError()
     
     @abstractmethod

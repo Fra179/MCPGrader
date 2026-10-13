@@ -76,9 +76,6 @@ class AssignmentTaskConfig:
         self.__performance_hash = hasher.hexdigest()
         return self.__performance_hash
 
-    def __hash__(self) -> int:
-        return hash(self.performance_hash())
-
 @dataclass_json
 @dataclass
 class AssignmentConfig:

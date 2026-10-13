@@ -20,7 +20,8 @@ class SlurmRunner(ABRunner):
         config["slurm_use_srun"] = False  # We are already running inside a SLURM job
 
         self.executor.update_parameters(**config)
-        job: Job = self.executor.submit(grading_function, *[task] + list(args), **kwargs)
+        # task only supplies the SLURM parameters; the function gets just args/kwargs
+        job: Job = self.executor.submit(grading_function, *args, **kwargs)
         jobid = self.job_idx
         self.jobs.append(job)
         self.job_idx += 1

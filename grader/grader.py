@@ -1,49 +1,20 @@
 from collections import defaultdict
 import json
-from typing import Any, Iterable
+from typing import Iterable
 from config import ProgramConfig, AssignmentConfig, AssignmentTaskConfig
-from git import Repo, Git, exc
+from git import Git, exc
 from aggregation import AGG_NAME_TO_CLASS
 from pathlib import Path
 from os import mkdir
 from shutil import rmtree
 from logging import Logger
 from runners import *
-from shutil import copyfile
-import subprocess
-import signal
 from .structs import GradeResult, TaskGradeResult
-from logger import build_logger
-import os
 from pusher.github_pusher import GithubPusher
 from grader_worker import GraderWorkerAPI, SubmissionInfo
-import shlex
-import tempfile
-from contextlib import contextmanager
-
-KILL_GRACE_SECONDS = 5  # how long a timed-out test script gets after each kill signal
-
-def write_json_atomic(path: Path, data: Any, indent: int | None = None) -> None:
-    """Write via a temp file and rename, so a crash never leaves a half-written file behind."""
-    tmp_path = path.with_name(path.name + ".tmp")
-    with open(tmp_path, 'w') as f:
-        json.dump(data, f, indent=indent)
-    os.replace(tmp_path, path)
-
-@contextmanager
-def deploy_key_env(deploy_key: str):
-    """Write the submitted private key to a 0600 temp file and yield the env that makes git use it."""
-    key = deploy_key.replace("\r\n", "\n").strip() + "\n"  # ssh rejects keys without a trailing newline
-
-    fd, path = tempfile.mkstemp(prefix="deploy_key_")
-    try:
-        with os.fdopen(fd, "w") as f:
-            f.write(key)
-        yield {
-            "GIT_SSH_COMMAND": f"ssh -F /dev/null -i {shlex.quote(path)} -o IdentitiesOnly=yes -o BatchMode=yes -o StrictHostKeyChecking=accept-new"
-        }
-    finally:
-        os.unlink(path)
+from .task_cache import TaskCache
+from .submission_grader import SubmissionGrader
+from .utils import deploy_key_env, write_json_atomic
 
 class Grader:
     def __init__(self, config: ProgramConfig, logger: Logger) -> None:
@@ -52,44 +23,21 @@ class Grader:
         self.log = logger
         self.job_ids: list[tuple] = []
         self.runner: ABRunner = self._get_runner()
-        # Keyed by the task config object, not by (assignment, task) name. Tasks of different
-        # assignments only share a key if they are identical in every field (name, script, SLURM
-        # config, skip, blocking, reduction, timeout); then both assignments would end up with the
-        # same cache in their files. As long as tasks aren't copied unchanged between assignments,
-        # every assignment keeps its own cache, so this is fine as is.
-        self.__cache = {}
+        self.caches: dict[tuple[str, str], TaskCache] = {}  # by (assignment name, task name)
 
         if not (self.wd / ".cache").exists():
             mkdir(self.wd / ".cache")
 
     def _open_caches_for_assignment(self, assignment_cfg: AssignmentConfig) -> None:
         for task in assignment_cfg.tasks:
-            self.__cache[task] = self._open_cache_file(task, assignment_cfg)
+            cache_file_path = self.wd / ".cache" / f"{assignment_cfg.name}_{task.name}_cache.json"
+            self.caches[(assignment_cfg.name, task.name)] = TaskCache(cache_file_path, task.performance_hash())
 
-    def _open_cache_file(self, task: AssignmentTaskConfig, assignment: AssignmentConfig) -> dict[str, Any]:
-        cache_file_path = self.wd / ".cache" / f"{assignment.name}_{task.name}_cache.json"
-        if not cache_file_path.exists():
-            with open(cache_file_path, 'w') as cache_file:
-                json.dump({"perf_hash": task.performance_hash(), "cache": {}}, cache_file)
-        
-        with open(cache_file_path, 'r') as cache_file:
-            cache: dict[str, Any] = json.load(cache_file)
-
-        if cache.get("perf_hash") != task.performance_hash():
-            cache["perf_hash"] = task.performance_hash()
-            cache["cache"] = {} 
-        
-        return cache
-    
-    def _save_cache_file(self, task: AssignmentTaskConfig, assignment: AssignmentConfig, cache: dict[str, Any]) -> None:
-        cache_file_path = self.wd / ".cache" / f"{assignment.name}_{task.name}_cache.json"
-        write_json_atomic(cache_file_path, cache, indent=4)
-
-    def _save_cache_file_for_assignment(self, assignment: AssignmentConfig) -> None:
+    def _save_caches_for_assignment(self, assignment: AssignmentConfig) -> None:
         for task in assignment.tasks:
-            cache = self.__cache.get(task)
+            cache = self.caches.get((assignment.name, task.name))
             if cache is not None:
-                self._save_cache_file(task, assignment, cache)
+                cache.save()
                 self.log.debug("Saved cache for task %s[%s]", assignment.name, task.name)
 
     def _grade_assignment(self, assignment_cfg: AssignmentConfig) -> None:
@@ -107,7 +55,7 @@ class Grader:
                 self.job_ids.append((assignment_cfg, task, None))
                 continue
 
-            updated_submissions = self._filter_updated_submissions(task, submissions, commit_hashes)
+            updated_submissions = self._filter_updated_submissions(self.caches[(assignment_cfg.name, task.name)], submissions, commit_hashes)
             if not updated_submissions:
                 self.log.info("No updated submissions for task %s[%s], not launching a job", assignment_cfg.name, task.name)
                 continue
@@ -121,16 +69,15 @@ class Grader:
 
             self.log.info("Launching grading job for task %s[%s] with %d updated submissions", assignment_cfg.name, task.name, len(updated_submissions))
             # TODO: submitit pickles the arguments (including every student's deploy_key) into
-            # <working_dir>/slurm_logs/*_submitted.pkl and never deletes them, so the keys stay on disk.
-            job_id = self.runner.run(self._grade_task, task, updated_submissions, results_dir, assignment_cfg.preserve_repo_files)
+            # <working_dir>/slurm_logs/*_submitted.pkl and never deletes them, so the keys stay on disk
+            # (readable only by the grader's user, see _get_runner).
+            submission_grader = SubmissionGrader(task, self.wd, assignment_cfg.preserve_repo_files, self.log.level)
+            job_id = self.runner.run(submission_grader.grade_all, task, updated_submissions, results_dir)
             self.job_ids.append((assignment_cfg, task, job_id))
 
             if blocking:
                 self.log.info("Waiting for blocking task %s[%s] to complete", assignment_cfg.name, task.name)
                 self.runner.wait(job_id)
-
-    def _repo_full_name(self, submission: SubmissionInfo) -> str:
-        return submission.ssh_url.split(":", 1)[1].removesuffix(".git")
 
     def _get_latest_commit_hash(self, submission: SubmissionInfo) -> str:
         with deploy_key_env(submission.deploy_key) as env:
@@ -153,8 +100,7 @@ class Grader:
 
         return commit_hashes
 
-    def _filter_updated_submissions(self, task: AssignmentTaskConfig, submissions: Iterable[SubmissionInfo], commit_hashes: dict[str, str | None]) -> list[SubmissionInfo]:
-        cache = self.__cache[task]["cache"]
+    def _filter_updated_submissions(self, cache: TaskCache, submissions: Iterable[SubmissionInfo], commit_hashes: dict[str, str | None]) -> list[SubmissionInfo]:
         updated_submissions = []
 
         for submission in submissions:
@@ -162,40 +108,13 @@ class Grader:
                 continue
 
             commit_hash = commit_hashes[submission.ssh_url]
-            if commit_hash is None or cache.get(submission.ssh_url) != commit_hash:
+            if commit_hash is None or not cache.is_graded(submission.ssh_url, commit_hash):
                 updated_submissions.append(submission)
 
         return updated_submissions
 
     def _results_dir(self, assignment: AssignmentConfig, task: AssignmentTaskConfig) -> Path:
         return self.wd / "results" / assignment.name / task.name
-
-    def _repo_dir(self, submission: SubmissionInfo, task: AssignmentTaskConfig) -> Path:
-        return self.wd / (self._repo_full_name(submission).replace('/', '_') + f"_{task.name}")
-
-    def _grade_task(self, task: AssignmentTaskConfig, submissions: Iterable[SubmissionInfo], results_dir: Path, preserve_repo_files: bool) -> None:
-        # Each result is written to results_dir as soon as it's ready, so if the job dies
-        # only the submission being graded at that moment is lost
-        task_id = int(os.environ.get('SLURM_PROCID', 0))
-
-        if task_id != 0:
-            return
-
-        logger = build_logger(name=f"grader.task.{task.name}", level=self.log.level)
-
-        for submission in submissions:
-            try:
-                res = self._grade_submission(submission, task, logger)
-                self._write_result(results_dir, res)
-            except Exception as e:
-                logger.error("Failed to grade submission %s[%s]: %s", submission.repo_url, task.name, str(e))
-            finally:
-                # Delete each clone right away, so a job holds at most one on disk
-                if not preserve_repo_files:
-                    rmtree(self._repo_dir(submission, task), ignore_errors=True)
-
-    def _write_result(self, results_dir: Path, result: TaskGradeResult) -> None:
-        write_json_atomic(results_dir / f"{result['name']}.json", result)
 
     def _read_results(self, results_dir: Path) -> list[TaskGradeResult]:
         results = []
@@ -207,119 +126,6 @@ class Grader:
                 self.log.error("Failed to read result file %s: %s", result_path, str(e))
         return results
            
-    def _grade_submission(self, submission: SubmissionInfo, task: AssignmentTaskConfig, log: Logger) -> TaskGradeResult:
-        log.info("Grading submission for %s[%s]", self._repo_full_name(submission), task.name)
-        repo_dir = self._repo_dir(submission, task)
-        
-        if repo_dir.exists():
-            log.info("Cleaning up existing repository directory %s", repo_dir)
-            rmtree(repo_dir)
-
-        log.debug("Downloading %s", submission.repo_url)
-        with deploy_key_env(submission.deploy_key) as env:
-            repo = Repo.clone_from(submission.ssh_url, repo_dir, env=env)
-
-        commit_hash = repo.head.commit.hexsha
-        log.debug("Cloned repository at commit %s", commit_hash)
-
-        result = self._grade_task_submission(task, submission, commit_hash, repo_dir, log)
-            
-        return result
-    
-    def _grade_task_submission(self, task: AssignmentTaskConfig, submission: SubmissionInfo, commit_hash: str, repo_dir: Path, log: Logger) -> TaskGradeResult:
-        # Use slurm to run the grading script
-        # Copy the grading script to the repo directory
-
-        grading_script_dest = repo_dir / Path(task.test_script_path).name
-        copyfile(task.test_script_path, grading_script_dest)
-
-        # Make the grading script executable
-        grading_script_dest.chmod(0o755)
-
-        log.debug("Copied grading script to %s", grading_script_dest)
-
-        # Run inside the slurm environment, pipe stdout to a variable
-        log.info("Running grading script")
-        
-        data = {}
-        error = ""
-        status = ""
-        stdout = ""
-        runtimes = []
-        
-        # TODO: agree on exit codes with the test scripts (0 graded, 1 student failure,
-        # 2 infrastructure failure) and don't cache 2, so it's retried on the next run.
-        returncode, stdout, stderr = self._run_test_script(grading_script_dest, repo_dir, task.submission_timeout, log)
-
-        if returncode is None:
-            log.error("Grading script timed out after %ss", task.submission_timeout)
-            error = f"Grading script timed out after {task.submission_timeout}s\n" + stderr
-            status = "timeout"
-        elif returncode != 0:
-            log.error("Grading script failed with error: %s", stderr)
-            error = stderr
-            status = "error"
-        else:
-            stdout = stdout.strip()
-            last_line = stdout.split('\n')[-1]
-
-            # {'passed': 12, 'total': 12, 'times': [442.44458, 664.421387, 886.576111, 354.137085, 442.864655, 663.164917, 884.586487, 354.348022, 443.62854, 664.1828, 885.255188, 354.565033]}
-            try:
-                data = json.loads(last_line)
-                runtimes = data.get("times", [])
-                status = "graded"
-            except json.JSONDecodeError:
-                log.error("Failed to parse grading script output as JSON: %s", last_line)
-                status = "error"
-                error = "Failed to parse grading script output as JSON. The script may have crashed or produced invalid output.\nLast line: " + last_line +  "\nFull stderr:\n" + stderr
-
-            log.info("Grading result: %s", data)
-            log.info("Grading script output: %s", stdout)
-
-        runtime = sum(runtimes) / len(runtimes) if runtimes else 0.0
-        log.info("Average runtime for %s [%s]: %.4f ms", submission.repo_url, task.name, runtime)
-
-        return {
-            "name": str(submission.student_id),
-            "commit_hash": commit_hash, 
-            "status": status, 
-            "error": error, 
-            "stdout": stdout, 
-            "runtimes": runtimes, 
-            "data": data, 
-            "repo_url": submission.ssh_url,
-        }
-
-    def _run_test_script(self, script: Path, cwd: Path, timeout: int | None, log: Logger) -> tuple[int | None, str, str]:
-        """Run the test script in its own process group. Returns (returncode, stdout, stderr); returncode is None on timeout."""
-        process = subprocess.Popen([script], cwd=cwd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, start_new_session=True)
-        try:
-            stdout, stderr = process.communicate(timeout=timeout)
-            return process.returncode, stdout, stderr
-        except subprocess.TimeoutExpired:
-            pass
-
-        # Kill the whole group, not just the script: make, srun and the student's binary would
-        # otherwise keep running and hold the output pipes open. SIGTERM first lets srun clean up.
-        for sig in (signal.SIGTERM, signal.SIGKILL):
-            try:
-                os.killpg(process.pid, sig)
-            except ProcessLookupError:
-                pass
-            try:
-                stdout, stderr = process.communicate(timeout=KILL_GRACE_SECONDS)
-                return None, stdout, stderr
-            except subprocess.TimeoutExpired:
-                continue
-
-        # Something that left the process group still holds the pipes: give up on the output
-        log.warning("Processes of %s survived SIGKILL of their group, discarding their output", script)
-        for pipe in (process.stdout, process.stderr):
-            if pipe:
-                pipe.close()
-        process.wait()
-        return None, "", ""
-
     def _retrieve_results(self, existing_data: dict) -> dict:
         data: dict[tuple[str, str], GradeResult] = defaultdict(lambda: GradeResult("", {}, {}, {}, {}, {}, {}, {}))
 
@@ -345,7 +151,7 @@ class Grader:
                 data[(assignment_cfg.name, name)].update_from_dict(result, task.name, AGG_NAME_TO_CLASS[task.reduction or "mean"]())
 
                 # Update the cache with the latest commit hash for this student and task
-                self.__cache[task]["cache"][result["repo_url"]] = result["commit_hash"]
+                self.caches[(assignment_cfg.name, task.name)].record(result["repo_url"], result["commit_hash"])
 
         result = defaultdict(list)
 
@@ -357,6 +163,7 @@ class Grader:
     def _get_runner(self) -> ABRunner:
         logs_dir = Path(self.config.grader.working_dir) / "slurm_logs"
         logs_dir.mkdir(parents=True, exist_ok=True)
+        logs_dir.chmod(0o700)  # submitit's pickles in here contain the students' deploy keys
         return SlurmRunner(logs_folder=str(logs_dir))
 
     # TODO (no immediate need): replace the grades file and the per-task cache files with a SQLite
@@ -392,7 +199,7 @@ class Grader:
         self._save_grades_file(results)
 
         for assignment in self.config.assignments:
-            self._save_cache_file_for_assignment(assignment)
+            self._save_caches_for_assignment(assignment)
 
         # TODO: the pushed file includes every student's full stdout and error; keep a private
         # file with the full results and push only the summary fields.
