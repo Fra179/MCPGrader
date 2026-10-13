@@ -23,6 +23,13 @@ from contextlib import contextmanager
 
 KILL_GRACE_SECONDS = 5  # how long a timed-out test script gets after each kill signal
 
+def write_json_atomic(path: Path, data: Any, indent: int | None = None) -> None:
+    """Write via a temp file and rename, so a crash never leaves a half-written file behind."""
+    tmp_path = path.with_name(path.name + ".tmp")
+    with open(tmp_path, 'w') as f:
+        json.dump(data, f, indent=indent)
+    os.replace(tmp_path, path)
+
 @contextmanager
 def deploy_key_env(deploy_key: str):
     """Write the submitted private key to a 0600 temp file and yield the env that makes git use it."""
@@ -45,6 +52,11 @@ class Grader:
         self.log = logger
         self.job_ids: list[tuple] = []
         self.runner: ABRunner = self._get_runner()
+        # Keyed by the task config object, not by (assignment, task) name. Tasks of different
+        # assignments only share a key if they are identical in every field (name, script, SLURM
+        # config, skip, blocking, reduction, timeout); then both assignments would end up with the
+        # same cache in their files. As long as tasks aren't copied unchanged between assignments,
+        # every assignment keeps its own cache, so this is fine as is.
         self.__cache = {}
 
         if not (self.wd / ".cache").exists():
@@ -71,8 +83,7 @@ class Grader:
     
     def _save_cache_file(self, task: AssignmentTaskConfig, assignment: AssignmentConfig, cache: dict[str, Any]) -> None:
         cache_file_path = self.wd / ".cache" / f"{assignment.name}_{task.name}_cache.json"
-        with open(cache_file_path, 'w') as cache_file:
-            json.dump(cache, cache_file, indent=4)
+        write_json_atomic(cache_file_path, cache, indent=4)
 
     def _save_cache_file_for_assignment(self, assignment: AssignmentConfig) -> None:
         for task in assignment.tasks:
@@ -102,6 +113,8 @@ class Grader:
                 continue
 
             # Clear results left by a previous run, so only this run's job is read back
+            # TODO: make runs restartable by ingesting leftover result files (from a run that
+            # crashed before retrieving them) instead of deleting them.
             results_dir = self._results_dir(assignment_cfg, task)
             rmtree(results_dir, ignore_errors=True)
             results_dir.mkdir(parents=True)
@@ -109,7 +122,7 @@ class Grader:
             self.log.info("Launching grading job for task %s[%s] with %d updated submissions", assignment_cfg.name, task.name, len(updated_submissions))
             # TODO: submitit pickles the arguments (including every student's deploy_key) into
             # <working_dir>/slurm_logs/*_submitted.pkl and never deletes them, so the keys stay on disk.
-            job_id = self.runner.run(self._grade_task, task, updated_submissions, results_dir)
+            job_id = self.runner.run(self._grade_task, task, updated_submissions, results_dir, assignment_cfg.preserve_repo_files)
             self.job_ids.append((assignment_cfg, task, job_id))
 
             if blocking:
@@ -157,7 +170,10 @@ class Grader:
     def _results_dir(self, assignment: AssignmentConfig, task: AssignmentTaskConfig) -> Path:
         return self.wd / "results" / assignment.name / task.name
 
-    def _grade_task(self, task: AssignmentTaskConfig, submissions: Iterable[SubmissionInfo], results_dir: Path) -> None:
+    def _repo_dir(self, submission: SubmissionInfo, task: AssignmentTaskConfig) -> Path:
+        return self.wd / (self._repo_full_name(submission).replace('/', '_') + f"_{task.name}")
+
+    def _grade_task(self, task: AssignmentTaskConfig, submissions: Iterable[SubmissionInfo], results_dir: Path, preserve_repo_files: bool) -> None:
         # Each result is written to results_dir as soon as it's ready, so if the job dies
         # only the submission being graded at that moment is lost
         task_id = int(os.environ.get('SLURM_PROCID', 0))
@@ -173,13 +189,13 @@ class Grader:
                 self._write_result(results_dir, res)
             except Exception as e:
                 logger.error("Failed to grade submission %s[%s]: %s", submission.repo_url, task.name, str(e))
+            finally:
+                # Delete each clone right away, so a job holds at most one on disk
+                if not preserve_repo_files:
+                    rmtree(self._repo_dir(submission, task), ignore_errors=True)
 
     def _write_result(self, results_dir: Path, result: TaskGradeResult) -> None:
-        result_path = results_dir / f"{result['name']}.json"
-        tmp_path = result_path.with_suffix(".json.tmp")
-        with open(tmp_path, 'w') as f:
-            json.dump(result, f)
-        os.replace(tmp_path, result_path)  # atomic, so a partially written result is never read
+        write_json_atomic(results_dir / f"{result['name']}.json", result)
 
     def _read_results(self, results_dir: Path) -> list[TaskGradeResult]:
         results = []
@@ -192,9 +208,8 @@ class Grader:
         return results
            
     def _grade_submission(self, submission: SubmissionInfo, task: AssignmentTaskConfig, log: Logger) -> TaskGradeResult:
-        full_name = self._repo_full_name(submission)
-        log.info("Grading submission for %s[%s]", full_name, task.name)
-        repo_dir = self.wd / (full_name.replace('/', '_') + f"_{task.name}")
+        log.info("Grading submission for %s[%s]", self._repo_full_name(submission), task.name)
+        repo_dir = self._repo_dir(submission, task)
         
         if repo_dir.exists():
             log.info("Cleaning up existing repository directory %s", repo_dir)
@@ -232,6 +247,8 @@ class Grader:
         stdout = ""
         runtimes = []
         
+        # TODO: agree on exit codes with the test scripts (0 graded, 1 student failure,
+        # 2 infrastructure failure) and don't cache 2, so it's retried on the next run.
         returncode, stdout, stderr = self._run_test_script(grading_script_dest, repo_dir, task.submission_timeout, log)
 
         if returncode is None:
@@ -264,7 +281,6 @@ class Grader:
 
         return {
             "name": str(submission.student_id),
-            "repo_dir": str(repo_dir), 
             "commit_hash": commit_hash, 
             "status": status, 
             "error": error, 
@@ -307,12 +323,8 @@ class Grader:
     def _retrieve_results(self, existing_data: dict) -> dict:
         data: dict[tuple[str, str], GradeResult] = defaultdict(lambda: GradeResult("", {}, {}, {}, {}, {}, {}, {}))
 
-        repos_to_cleanup = set()
-
-
-        # compute the students to keep because they were not re-graded
-        # data_to_add: dict[tuple[str, str, str], GradeResult] = defaultdict(lambda: GradeResult("", "", {}, {}, {}, {}, {}))
-
+        # Start from the existing grades, so students who weren't regraded are kept
+        # TODO: drop students no longer in the worker and tasks no longer in the config.
         for assignment_name, students in existing_data.items():
             for student in students:
                 data[(assignment_name, student["name"])] = GradeResult.from_dict(student)
@@ -331,18 +343,9 @@ class Grader:
             for result in self._read_results(self._results_dir(assignment_cfg, task)):
                 name = result["name"]
                 data[(assignment_cfg.name, name)].update_from_dict(result, task.name, AGG_NAME_TO_CLASS[task.reduction or "mean"]())
-            
-                repo_dir = Path(result["repo_dir"])
-                if not assignment_cfg.preserve_repo_files and repo_dir.exists():
-                    repos_to_cleanup.add(repo_dir)
 
                 # Update the cache with the latest commit hash for this student and task
                 self.__cache[task]["cache"][result["repo_url"]] = result["commit_hash"]
-
-        # Cleanup repositories
-        for repo_dir in repos_to_cleanup:
-            rmtree(repo_dir, ignore_errors=True)
-            self.log.debug("Deleted repository files for %s", repo_dir.name.replace('_', '/'))
 
         result = defaultdict(list)
 
@@ -356,6 +359,10 @@ class Grader:
         logs_dir.mkdir(parents=True, exist_ok=True)
         return SlurmRunner(logs_folder=str(logs_dir))
 
+    # TODO (no immediate need): replace the grades file and the per-task cache files with a SQLite
+    # database: a results table with the perf_hash and every attempt, the leaderboard exported from
+    # it, and grades plus cache saved in one transaction. Only the main process on the submitter node
+    # may open it (SQLite locking is unreliable on NFS/Lustre); jobs keep writing result files.
     def _load_grades_file(self) -> dict:
         grades_file_path = Path(self.config.grader.grades_file)
         if grades_file_path.exists():
@@ -364,9 +371,7 @@ class Grader:
         return {}
     
     def _save_grades_file(self, data: dict) -> None:
-        grades_file_path = Path(self.config.grader.grades_file)
-        with open(grades_file_path, 'w') as f:
-            json.dump(data, f, indent=4)
+        write_json_atomic(Path(self.config.grader.grades_file), data, indent=4)
 
     def grade(self):
         data = self._load_grades_file()
@@ -382,12 +387,16 @@ class Grader:
 
         results = self._retrieve_results(data)
 
+        # Grades before caches: a crash in between only causes a regrade, never a cached
+        # commit whose result was lost. Both before pushing, so a failed push loses nothing.
         self._save_grades_file(results)
 
+        for assignment in self.config.assignments:
+            self._save_cache_file_for_assignment(assignment)
+
+        # TODO: the pushed file includes every student's full stdout and error; keep a private
+        # file with the full results and push only the summary fields.
         if self.config.pusher and self.config.pusher.push:
             pusher = GithubPusher(self.config.pusher)
             commit_sha = pusher.push_results(self.config.grader.grades_file)
             self.log.info("Pushed results to GitHub repository %s at commit %s", self.config.pusher.github_repo, commit_sha)
-
-        for assignment in self.config.assignments:
-            self._save_cache_file_for_assignment(assignment)

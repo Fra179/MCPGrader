@@ -1,10 +1,10 @@
 from abc import ABC, abstractmethod
+from typing import Any, Callable
 from config.configs import AssignmentTaskConfig
-from grader.structs import TaskGradeResult
 
 class ABRunner(ABC):
     @abstractmethod
-    def run(self, grading_function: callable[[AssignmentTaskConfig, ...]], task: AssignmentTaskConfig, *args, **kwargs) -> int:
+    def run(self, grading_function: Callable[..., Any], task: AssignmentTaskConfig, *args, **kwargs) -> int:
         raise NotImplementedError()
     
     @abstractmethod
@@ -16,5 +16,6 @@ class ABRunner(ABC):
         raise NotImplementedError()
 
     @abstractmethod
-    def collect_results(self, jobid: int) -> list[TaskGradeResult]:
+    def collect_results(self, jobid: int) -> Any:
+        """Return value of the job's function; raises if the job failed."""
         raise NotImplementedError()

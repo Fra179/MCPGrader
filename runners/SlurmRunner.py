@@ -2,9 +2,7 @@ from .ABRunner import ABRunner
 from config.configs import AssignmentTaskConfig
 import submitit
 from submitit import Job
-from typing import Callable
-from submitit.core.core import R
-import typing as tp
+from typing import Any, Callable
 
 class SlurmRunner(ABRunner):
     def __init__(self, logs_folder: str = "./logs"):
@@ -13,7 +11,7 @@ class SlurmRunner(ABRunner):
         self.jobs: list[Job] = []
         self.job_idx = 0
 
-    def run(self, grading_function: Callable[[AssignmentTaskConfig, ...]], task: AssignmentTaskConfig, *args, **kwargs) -> int:
+    def run(self, grading_function: Callable[..., Any], task: AssignmentTaskConfig, *args, **kwargs) -> int:
         config = task.slurm_backend.config.copy() 
 
         if not config.get("slurm_job_name"):
@@ -36,7 +34,7 @@ class SlurmRunner(ABRunner):
         job = self.jobs[jobid]
         job.wait()
     
-    def collect_results(self, jobid: int) -> dict:
+    def collect_results(self, jobid: int) -> Any:
         job = self.jobs[jobid]
 
         # You shouldn't access private members of a class like this

@@ -5,7 +5,6 @@ from aggregation.ABAggregation import ABAggregation
 
 class TaskGradeResult(TypedDict):
     name: str
-    repo_dir: str
     commit_hash: str
     repo_url: str
     status: str
