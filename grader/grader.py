@@ -4,11 +4,6 @@ from typing import Any, Iterable
 from config import ProgramConfig, AssignmentConfig, AssignmentTaskConfig
 from git import Repo, Git, exc
 from aggregation import AGG_NAME_TO_CLASS
-from gh import GithubClassroomAPI
-from gh.filters import By
-from gh.exceptions import GitHubException
-from gh.structs import SubmissionInfo
-from .exceptions import GraderException
 from pathlib import Path
 from os import mkdir
 from shutil import rmtree
@@ -20,24 +15,37 @@ from .structs import GradeResult, TaskGradeResult
 from logger import build_logger
 import os
 from pusher.github_pusher import GithubPusher
+from grader_worker import GraderWorkerAPI, SubmissionInfo
+import shlex
+import tempfile
+from contextlib import contextmanager
+
+@contextmanager
+def deploy_key_env(deploy_key: str):
+    """Write the submitted private key to a 0600 temp file and yield the env that makes git use it."""
+    key = deploy_key.replace("\r\n", "\n").strip() + "\n"  # ssh rejects keys without a trailing newline
+
+    fd, path = tempfile.mkstemp(prefix="deploy_key_")
+    try:
+        with os.fdopen(fd, "w") as f:
+            f.write(key)
+        yield {
+            "GIT_SSH_COMMAND": f"ssh -F /dev/null -i {shlex.quote(path)} -o IdentitiesOnly=yes -o BatchMode=yes -o StrictHostKeyChecking=accept-new"
+        }
+    finally:
+        os.unlink(path)
 
 class Grader:
-    def __init__(self, config: ProgramConfig, pat: str, logger: Logger) -> None:
+    def __init__(self, config: ProgramConfig, logger: Logger) -> None:
         self.config = config
-        self.pat = pat
-        self.classroom = GithubClassroomAPI(pat)
         self.wd = Path(config.grader.working_dir)
-        self.git = Git(self.wd / ".git")
         self.log = logger
         self.job_ids: list[tuple] = []
         self.runner: ABRunner = self._get_runner()
-        self.previous_grades: dict = {}
         self.__cache = {}
-        self.__name_to_repo_url = {}
 
         if not (self.wd / ".cache").exists():
             mkdir(self.wd / ".cache")
-
 
     def _open_caches_for_assignment(self, assignment_cfg: AssignmentConfig) -> None:
         for task in assignment_cfg.tasks:
@@ -70,21 +78,10 @@ class Grader:
                 self._save_cache_file(task, assignment, cache)
                 self.log.debug("Saved cache for task %s[%s]", assignment.name, task.name)
 
-    def _get_assignment(self, assignment_cfg: AssignmentConfig):
-        if assignment_cfg.invite_link:
-            assignment = self.classroom.get_assignment_by(By.INVITE_LINK, assignment_cfg.invite_link)
-        elif assignment_cfg.slug:
-            assignment = self.classroom.get_assignment_by(By.SLUG, assignment_cfg.slug)
-        elif assignment_cfg.id:
-            assignment = self.classroom.get_assignment_by(By.ID, assignment_cfg.id)
-        else:
-            raise GitHubException("No valid identifier provided for assignment.")
-        
-        return assignment
-
     def _grade_assignment(self, assignment_cfg: AssignmentConfig) -> None:
-        assignment = self._get_assignment(assignment_cfg)
-        submissions = self.classroom.get_submissions_for_assignment(assignment.id)
+        worker = GraderWorkerAPI(self.config.grader.worker_url, self.config.grader.worker_private_key)
+        submissions = worker.get_submissions(assignment_cfg.name)
+        self.log.info("Found %d submissions for assignment %s", len(submissions), assignment_cfg.name)
 
         for task in assignment_cfg.tasks:
             blocking = task.blocking
@@ -95,6 +92,8 @@ class Grader:
                 continue
             
             self.log.info("Launching grading job for task: %s[%s]", assignment_cfg.name, task.name)
+            # TODO: submitit pickles the arguments (including every student's deploy_key) into
+            # <working_dir>/slurm_logs/*_submitted.pkl and never deletes them, so the keys stay on disk.
             job_id = self.runner.run(self._grade_task, task, submissions)
             self.job_ids.append((assignment_cfg, task, job_id))
 
@@ -102,23 +101,35 @@ class Grader:
                 self.log.info("Waiting for blocking task %s[%s] to complete", assignment_cfg.name, task.name)
                 self.runner.wait(job_id)
 
-    def _get_latest_commit_hash(self, submission: SubmissionInfo) -> str:
-        repo_url = submission.repository.html_url.replace("https://", f"https://{self.pat}@")
-        commit_hash = self.git.ls_remote(repo_url, "HEAD").split()[0]
-        return commit_hash
+    def _repo_full_name(self, submission: SubmissionInfo) -> str:
+        return submission.ssh_url.split(":", 1)[1].removesuffix(".git")
 
-    def _filter_updated_submissions(self, task: AssignmentTaskConfig, submissions: Iterable[SubmissionInfo]) -> list[SubmissionInfo]:
+    def _get_latest_commit_hash(self, submission: SubmissionInfo) -> str:
+        with deploy_key_env(submission.deploy_key) as env:
+            git = Git()  # fresh instance so the per-submission env isn't shared
+            with git.custom_environment(**env):
+                return git.ls_remote(submission.ssh_url, "HEAD").split()[0]
+
+    def _filter_updated_submissions(self, task: AssignmentTaskConfig, submissions: Iterable[SubmissionInfo], log: Logger) -> list[SubmissionInfo]:
         updated_submissions = []
         
         for submission in submissions:
             failed_to_get_commit_hash = False
+            empty = False
+
             try:
                 commit_hash = self._get_latest_commit_hash(submission)
             except exc.GitCommandError as e:
-                self.log.warning("Failed to get commit hash for submission %s, marking as updated", submission.repository.html_url)
+                log.warning("Failed to get commit hash for submission %s, marking as updated", submission.repo_url)
                 failed_to_get_commit_hash = True
+            except IndexError as e:
+                empty = True
+            
+            if empty:
+                log.info("Submission %s has no commits, skipping grading", submission.repo_url)
+                continue
 
-            if failed_to_get_commit_hash or self.__cache[task]["cache"].get(submission.repository.html_url) != commit_hash:
+            if failed_to_get_commit_hash or self.__cache[task]["cache"].get(submission.ssh_url) != commit_hash:
                 updated_submissions.append(submission)
 
         return updated_submissions
@@ -132,37 +143,36 @@ class Grader:
 
         logger = build_logger(name=f"grader.task.{task.name}", level=self.log.level)
 
-        submissions = filter(lambda x: x.commit_count > 0, submissions)
-
-        for submission in self._filter_updated_submissions(task, submissions):
+        for submission in self._filter_updated_submissions(task, submissions, logger):
             try:
                 res = self._grade_submission(submission, task, logger)
                 data.append(res)
             except Exception as e:
-                logger.error("Failed to grade submission %s[%s]: %s", submission.repository.full_name, task.name, str(e))
+                logger.error("Failed to grade submission %s[%s]: %s", submission.repo_url, task.name, str(e))
 
         return data
            
     def _grade_submission(self, submission: SubmissionInfo, task: AssignmentTaskConfig, log: Logger) -> TaskGradeResult:
-        log.info("Grading submission for %s[%s]", submission.repository.full_name, task.name)
-        repo_dir = self.wd / (submission.repository.full_name.replace('/', '_') + f"_{task.name}")
+        full_name = self._repo_full_name(submission)
+        log.info("Grading submission for %s[%s]", full_name, task.name)
+        repo_dir = self.wd / (full_name.replace('/', '_') + f"_{task.name}")
         
         if repo_dir.exists():
             log.info("Cleaning up existing repository directory %s", repo_dir)
             rmtree(repo_dir)
 
-        log.debug("Downloading %s", submission.repository.html_url)
-        repo_url = submission.repository.html_url.replace("https://", f"https://{self.pat}@")
-        repo = Repo.clone_from(repo_url, repo_dir)
+        log.debug("Downloading %s", submission.repo_url)
+        with deploy_key_env(submission.deploy_key) as env:
+            repo = Repo.clone_from(submission.ssh_url, repo_dir, env=env)
 
         commit_hash = repo.head.commit.hexsha
         log.debug("Cloned repository at commit %s", commit_hash)
 
-        result = self._grade_task_submission(task, submission, commit_hash, repo_dir)
+        result = self._grade_task_submission(task, submission, commit_hash, repo_dir, log)
             
         return result
     
-    def _grade_task_submission(self, task: AssignmentTaskConfig, submission: SubmissionInfo, commit_hash: str, repo_dir: Path) -> TaskGradeResult:
+    def _grade_task_submission(self, task: AssignmentTaskConfig, submission: SubmissionInfo, commit_hash: str, repo_dir: Path, log: Logger) -> TaskGradeResult:
         # Use slurm to run the grading script
         # Copy the grading script to the repo directory
 
@@ -172,10 +182,10 @@ class Grader:
         # Make the grading script executable
         grading_script_dest.chmod(0o755)
 
-        self.log.debug("Copied grading script to %s", grading_script_dest)
+        log.debug("Copied grading script to %s", grading_script_dest)
 
         # Run inside the slurm environment, pipe stdout to a variable
-        self.log.info("Running grading script")
+        log.info("Running grading script")
         
         data = {}
         error = ""
@@ -195,23 +205,23 @@ class Grader:
                 runtimes = data.get("times", [])
                 status = "graded"
             except json.JSONDecodeError:
-                self.log.error("Failed to parse grading script output as JSON: %s", last_line)
+                log.error("Failed to parse grading script output as JSON: %s", last_line)
                 status = "error"
                 error = "Failed to parse grading script output as JSON. The script may have crashed or produced invalid output.\nLast line: " + last_line +  "\nFull stderr:\n" + result.stderr
 
-            self.log.info("Grading result: %s", data)
-            self.log.info("Grading script output: %s", result.stdout)
+            log.info("Grading result: %s", data)
+            log.info("Grading script output: %s", result.stdout)
         except subprocess.CalledProcessError as e:
-            self.log.error("Grading script failed with error: %s", e.stderr)
+            log.error("Grading script failed with error: %s", e.stderr)
             error = e.stderr
             stdout = e.stdout
             status = "error"
 
         runtime = sum(runtimes) / len(runtimes) if runtimes else 0.0
-        self.log.info("Average runtime for %s [%s]: %.4f ms", submission.repository.full_name, task.name, runtime)
+        log.info("Average runtime for %s [%s]: %.4f ms", submission.repo_url, task.name, runtime)
 
         return {
-            "name": submission.pretty_users, 
+            "name": str(submission.student_id),
             "repo_dir": str(repo_dir), 
             "commit_hash": commit_hash, 
             "status": status, 
@@ -219,7 +229,7 @@ class Grader:
             "stdout": stdout, 
             "runtimes": runtimes, 
             "data": data, 
-            "repo_url": submission.repository.html_url,
+            "repo_url": submission.ssh_url,
             "reduction": AGG_NAME_TO_CLASS[task.reduction or "mean"](),
         }  # Placeholder grade
                 
@@ -290,8 +300,6 @@ class Grader:
 
     def grade(self):
         data = self._load_grades_file()
-        self.previous_grades = data
-        self.jobs = []
 
         for assignment in self.config.assignments:
             self.log.debug("Loading cache files for assignment: %s", assignment.name)

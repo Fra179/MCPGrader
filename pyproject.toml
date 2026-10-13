@@ -4,6 +4,7 @@ version = "0.1.0"
 description = "Add your description here"
 requires-python = ">=3.14"
 dependencies = [
+    "cryptography>=46.0.3",
     "dataclasses-json>=0.6.7",
     "gitpython>=3.1.45",
     "pygithub>=2.8.1",

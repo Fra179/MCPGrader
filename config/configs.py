@@ -80,15 +80,11 @@ class AssignmentTaskConfig:
 class AssignmentConfig:
     name: str
     tasks: List[AssignmentTaskConfig]
-    invite_link: Optional[str] = None
-    slug: Optional[str] = None
-    id: Optional[int] = None
     preserve_repo_files: bool = False
 
 
     def assert_valid(self) -> None:
         assert isinstance(self.name, str) and self.name, "name must be a non-empty string"
-        assert any([self.invite_link, self.slug, self.id]), "at least one of invite_link, slug, or id must be provided"
         assert isinstance(self.preserve_repo_files, bool), "preserve_repo_files must be a boolean"
         assert isinstance(self.tasks, list) and self.tasks, "tasks must be a non-empty list"
         for task in self.tasks:
@@ -103,13 +99,18 @@ class AssignmentConfig:
 class GraderConfig:
     working_dir: str
     grades_file: str
+    worker_url: str # base URL of the grader Cloudflare Worker
+    worker_private_key: str # path to the ECDSA P-256 admin key (PEM) used to sign worker requests
     sentry_dsn: Optional[str] = None
-    github_pat: Optional[str] = None
 
     def assert_valid(self) -> None:
         assert isinstance(self.working_dir, str) and self.working_dir, "working_dir must be a non-empty string"
         assert path.exists(self.working_dir), f"working_dir {self.working_dir} does not exist"
         assert isinstance(self.grades_file, str) and self.grades_file, "grades_file must be a non-empty string"
+        assert isinstance(self.worker_url, str) and self.worker_url.startswith(("https://", "http://")), "worker_url must be an http(s) URL"
+        assert isinstance(self.worker_private_key, str) and self.worker_private_key, "worker_private_key must be a non-empty string"
+        assert path.exists(self.worker_private_key), f"worker_private_key {self.worker_private_key} does not exist"
+
 
 @dataclass_json
 @dataclass

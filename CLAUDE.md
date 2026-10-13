@@ -1,0 +1,31 @@
+# CLAUDE.md
+
+This file provides guidance to Claude Code (claude.ai/code) when working with code in this repository.
+
+## Commands
+
+Python >=3.14, managed with `uv`. There is no test suite or linter configured.
+
+- `uv sync` — install dependencies
+- `uv run main.py` — run the grader (reads `grader-config.yaml` from the cwd; copy from `grader-config-example.yaml`)
+- `uv run python -m grader_worker.GraderWorkerApi <worker URL> <admin key file> [assignment]` — sanity-check the worker URL and admin key by printing submissions
+
+`grader-config.yaml`, `*.json` (incl. `leaderboard.json`), `keys/`, `*.lock` and `test_scripts/*.sh` are gitignored. Config validation (`assert_valid`) requires `working_dir`, the `worker_private_key` file and each `test_script_path` to already exist.
+
+## Architecture
+
+The grader is meant to run on a SLURM cluster: `main.py` → `Grader.grade()` ([grader/grader.py](grader/grader.py)).
+
+Flow:
+1. For each assignment, `GraderWorkerAPI` ([grader_worker/](grader_worker/)) lists submissions from the grader Cloudflare Worker (`POST /submissions` with `assignment_name` = the assignment's `name`). Requests are signed with the ECDSA P-256 admin key in `worker_private_key` (raw `r||s` signature over `METHOD\npath\ntimestamp\nsha256(body)`; the worker allows 60 s of clock skew). The worker returns the normalized `repo_ssh_url` and the generated private deploy key.
+2. For each task, `SlurmRunner` ([runners/SlurmRunner.py](runners/SlurmRunner.py), via `submitit`) submits `Grader._grade_task` as a SLURM job using the task's `slurm_backend.config` as submitit parameters. `blocking` tasks are waited on immediately; otherwise all jobs are awaited with `wait_all()`.
+3. Inside the job, only SLURM rank 0 works. Submissions are filtered by comparing `git ls-remote HEAD` with a per-task cache (`<working_dir>/.cache/<assignment>_<task>_cache.json`); changed repos are cloned over SSH with the student's deploy key (`deploy_key_env` writes it to a 0600 temp file and sets `GIT_SSH_COMMAND`), the task's test script is copied in and executed, and the **last stdout line** is parsed as JSON (`{"passed", "total", "times"}`).
+4. `_retrieve_results` merges new per-task results into the existing `grades_file` (keyed by assignment + student name, so students not re-graded are preserved), updates caches, deletes clones unless `preserve_repo_files`, and optionally pushes the leaderboard via `pusher/github_pusher.py` (the only place a GitHub token is used).
+
+Things that span files:
+- **Cache invalidation**: `AssignmentTaskConfig.performance_hash()` (task name, script path *and contents*, SLURM config, reduction) is stored in each cache file; if it changes, the cache is dropped and everything is re-graded.
+- **Aggregations**: `aggregation/` holds `ABAggregation` subclasses registered in `AGG_NAME_TO_CLASS` (`mean`, `median`). A task's optional `reduction` selects one; `GradeResult` ([grader/structs.py](grader/structs.py)) uses it to compute per-task `avg_runtime`, and serializes only the name. New aggregations must be added to `AGGS_LIST`.
+- **Result shape**: `GradeResult` stores every field as a dict keyed by task name, so the leaderboard JSON is per-student with per-task sub-dicts (README's "Output Format" section is outdated in this respect).
+- The `submitit` job runs a bound method of `Grader`, so state it needs must be picklable; `SlurmRunner.collect_results` reads `job._sub_jobs[0]` to return only rank 0's result.
+
+Note: `grader/deploy_key_env.py` duplicates the `deploy_key_env` context manager defined inline in `grader/grader.py`; the in-file copy is the one used. The old `gh/` (GitHub API) and `google_form/` (Google Forms) submission sources were removed in favor of `grader_worker/`.

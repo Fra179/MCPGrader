@@ -285,3 +285,4 @@ grader-config.yaml
 test_scripts/*.sh
 *.json
 *.lock
+keys/

@@ -1,19 +1,19 @@
 grader:
   working_dir: "/tmp/grader"
   grades_file: "leaderboard.json"
-  github_pat: "pat_example_1234567890"
+  worker_url: "https://grader-api.example.com"
+  worker_private_key: "keys/grader.key" # admin key authorized in the worker's ADMIN_PUBLIC_KEYS
   sentry_dsn: ""
 
 pusher:
   github_repo: "user/MCPLeaderboard"
-  github_pat: "pat_example_1234567890" # Can be the same as grader.github_pat
+  github_pat: "pat_example_1234567890" # needs write access to github_repo
   save_file: "data/leaderboard.json"
   push: true
 
 
 assignments:
-  - name: "vector-sum"
-    invite_link: "https://classroom.github.com/a/example1"
+  - name: "vector-sum" # must match the assignment_name students submit to the worker
     preserve_repo_files: false
 
     tasks:

@@ -1,6 +1,6 @@
-# GitHub Classroom Autograder
+# MCPGrader
 
-An automated grading system for GitHub Classroom assignments that clones student repositories, runs test scripts, collects performance metrics, and generates a leaderboard with results.
+An automated grading system that reads student submissions from the [grader worker](#grader-worker-setup) (a Cloudflare Worker), clones each student's repository with the deploy key the worker issued for it, runs test scripts, collects performance metrics, and generates a leaderboard with results.
 
 ## Table of Contents
 
@@ -12,8 +12,10 @@ An automated grading system for GitHub Classroom assignments that clones student
   - [Step 2: Configure the Grader Section](#step-2-configure-the-grader-section)
   - [Step 3: Configure the Pusher Section](#step-3-configure-the-pusher-section)
   - [Step 4: Configure Assignments](#step-4-configure-assignments)
-  - [Step 5: Configure SLURM Backend](#step-5-configure-slurm-backend)
-- [GitHub Personal Access Token](#github-personal-access-token)
+  - [Step 5: Configure SLURM Backend for Tasks](#step-5-configure-slurm-backend-for-tasks)
+- [Grader Worker Setup](#grader-worker-setup)
+  - [Admin Key](#admin-key)
+  - [What Students Submit](#what-students-submit)
 - [Running the Grader](#running-the-grader)
 - [Setting Up as a Recurrent Task](#setting-up-as-a-recurrent-task)
 - [Test Script Format](#test-script-format)
@@ -22,18 +24,19 @@ An automated grading system for GitHub Classroom assignments that clones student
 ## Overview
 
 This grading system automates the process of:
-1. Fetching student submissions from GitHub Classroom
-2. Cloning student repositories
+1. Reading student submissions (student ID, repository URL, deploy key) from the grader worker
+2. Cloning student repositories over SSH with each student's deploy key
 3. Running test scripts with configurable SLURM resources
 4. Collecting results including pass/fail status and performance metrics
 5. Generating a JSON leaderboard with all results
 
 ## Features
 
-- **Automated GitHub Classroom Integration**: Fetches assignments and submissions via GitHub API
+- **Worker Submissions**: Reads submissions from the grader worker's admin API, with signed requests
+- **Per-Student Deploy Keys**: Clones private repositories without a GitHub token, using the read-only deploy key the worker generated for each repository
 - **SLURM Support**: Execute test scripts with configurable SLURM resources (CPU, memory, GPUs, etc.)
 - **Performance Metrics**: Collects runtime statistics from test scripts
-- **Flexible Assignment Identification**: Use invite links, slugs, or assignment IDs
+- **Incremental Grading**: Only re-grades repositories whose latest commit changed since the last run
 - **Blocking/Non-blocking Execution**: Control whether to wait for assignment completion
 - **Repository Cleanup**: Option to preserve or delete cloned repositories
 - **Leaderboard Generation**: JSON output with all results and metrics
@@ -67,14 +70,17 @@ Edit the `grader` section in `grader-config.yaml`:
 grader:
   working_dir: "/tmp/grader"
   grades_file: "leaderboard.json"
-  github_pat: "github_pat_xxxxx"  # Optional, can use ENV variable instead
+  worker_url: "https://grader-api.example.com"
+  worker_private_key: "keys/grader.key"
+  sentry_dsn: ""
 ```
 
 **Field Explanations:**
 
 - **`working_dir`**: Directory where student repositories will be cloned. This directory must exist before running the grader.
 - **`grades_file`**: Path to the output JSON file containing all grading results and the leaderboard.
-- **`github_pat`**: (Optional) Your GitHub Personal Access Token. Can be omitted if provided via environment variable (see [GitHub Personal Access Token](#github-personal-access-token) section).
+- **`worker_url`** (required): Base URL of the grader worker.
+- **`worker_private_key`** (required): Path to the ECDSA P-256 admin private key (PEM) used to sign requests to the worker. This file must exist before running the grader. See [Admin Key](#admin-key).
 - **`sentry_dsn`**: (Optional) Sentry DSN for error tracking and monitoring. Leave empty if not using Sentry.
 
 ### Step 3: Configure the Pusher Section
@@ -92,9 +98,9 @@ pusher:
 **Field Explanations:**
 
 - **`github_repo`**: The target GitHub repository in the format `owner/repo` where the leaderboard will be pushed (e.g., `"myorg/leaderboard"`).
-- **`github_pat`**: GitHub Personal Access Token for pushing to the target repository. Can be the same as `grader.github_pat` or a different token if using separate accounts. Can be omitted if provided via environment variable.
+- **`github_pat`**: GitHub Personal Access Token with write access to the target repository. The pusher is the only part of the grader that uses a GitHub token.
 - **`save_file`**: Path within the target repository where the leaderboard JSON file will be saved (e.g., `"data/leaderboard.json"`).
-- **`push`**: Whether to enable pushing to GitHub (default: `false`). Set to `true` to automatically commit and push the leaderboard after grading completes.
+- **`push`**: Whether to enable pushing to GitHub (default: `true`). Set to `true` to automatically commit and push the leaderboard after grading completes.
 
 **Example Workflow:**
 When `push: true`, the pusher will:
@@ -112,7 +118,6 @@ Add assignments to the `assignments` list. Each assignment can have multiple tas
 ```yaml
 assignments:
   - name: "vector-sum"
-    invite_link: "https://classroom.github.com/a/example1"
     preserve_repo_files: false
 
     tasks:
@@ -146,17 +151,10 @@ assignments:
             cpus_per_task: 4
             gpus_per_node: 1
 ```
-5
+
 **Assignment-Level Field Explanations:**
 
-- **`name`** (required): A unique identifier for the assignment. Used as the key in the output JSON.
-
-- **Assignment Identification** (at least one required):
-  - **`invite_link`**: The GitHub Classroom assignment invite URL (e.g., `https://classroom.github.com/a/xxxxx`)
-  - **`slug`**: The assignment slug from GitHub Classroom (alternative to invite_link)
-  - **`id`**: The numeric assignment ID (alternative to invite_link or slug)
-  
-  Note: You only need to provide **one** of these three identifiers.
+- **`name`** (required): A unique identifier for the assignment. Used as the key in the output JSON, and as the `assignment_name` whose submissions are fetched from the worker, so it must match exactly what students submit.
 
 - **`preserve_repo_files`** (default: `false`): If `true`, cloned repositories will not be deleted after grading. Useful for debugging.
 
@@ -175,7 +173,7 @@ assignments:
 >### [!] Important [!]
 >When writing your test script don't forget to launch the student's script with either `srun`, `mpirun` or a similar command that will also schedule the process on the cluster!
 
-### Step 4: Configure SLURM Backend for Tasks
+### Step 5: Configure SLURM Backend for Tasks
 
 The `slurm_backend.config` section within each task accepts parameters that are passed directly to **submitit**, which manages SLURM job submissions. Each task can have different SLURM resource requirements.
 
@@ -205,47 +203,34 @@ slurm_backend:
 
 For a complete list of available parameters, refer to the [submitit documentation](https://github.com/facebookincubator/submitit).
 
-## GitHub Personal Access Token
+## Grader Worker Setup
 
-The grader requires a GitHub Personal Access Token (PAT) with appropriate permissions to access GitHub Classroom data and clone student repositories.
+Students submit their repositories to the grader worker (`grader-worker`), a Cloudflare Worker that stores each submission and the deploy key it generated for it. Deploy the worker as described in its README.
 
-### Creating a PAT
+### Admin Key
 
-1. Go to GitHub Settings → Developer settings → Personal access tokens → Tokens (classic)
-2. Generate a new token with the following scopes:
-   - `repo` (Full control of private repositories)
-   - `read:org` (Read organization data)
-   - `admin:org` (if managing classroom assignments)
-
-### Providing the PAT
-
-You have two options:
-
-**Option 1: Environment Variable** (Recommended)
+The grader lists submissions with `POST /submissions`, an admin endpoint whose requests must be signed with an ECDSA P-256 key authorized in the worker's `ADMIN_PUBLIC_KEYS`. In the worker repository:
 
 ```bash
-export GH_PAT="github_pat_xxxxx"
-uv run main.py
+scripts/admin-keys.sh new grader-server   # keys/grader-server.key (private) + keys/grader-server.pub
+scripts/admin-keys.sh push                # authorize it on the deployed worker
 ```
 
-Or inline:
+Copy `keys/grader-server.key` to the grader machine and point `grader.worker_private_key` at it. Keep it secret: it gives access to every student's deploy key. `keys/` is listed in `.gitignore`.
+
+The worker rejects requests whose timestamp is more than 60 seconds off its clock, so keep the grader machine's clock in sync.
+
+To check that the URL and the key work, print an assignment's submissions:
+
 ```bash
-GH_PAT="github_pat_xxxxx" uv run main.py
+uv run python -m grader_worker.GraderWorkerApi https://grader-api.example.com keys/grader-server.key vector-sum
 ```
 
-**Option 2: Configuration File**
+### What Students Submit
 
-Add it directly to `grader-config.yaml`:
-```yaml
-grader:
-  github_pat: "github_pat_xxxxx"
-```
+Students `POST /submit` to the worker with the assignment name, repository URL, student ID and email. The worker answers with the public half of a freshly generated deploy key, which the student adds under **Settings → Deploy keys → Add deploy key** with **Allow write access** unchecked.
 
-As shown in [main.py](main.py), the environment variable takes precedence over the config file value:
-
-```python
-token = os.getenv("GH_PAT") or config.config.grader.github_pat
-```
+Because the key is read-only and only works for that one repository, the grader can clone private repositories without a GitHub token. If a repository has no commits yet, or its deploy key hasn't been added, it is skipped until it does.
 
 ## Running the Grader
 
@@ -260,8 +245,9 @@ python main.py
 The grader will:
 1. Read the configuration file
 2. For each assignment (unless skipped):
-   - Fetch student submissions from GitHub Classroom
-   - Clone each student's repository
+   - Read student submissions for the assignment from the grader worker
+   - Skip repositories whose latest commit was already graded
+   - Clone each student's repository with their deploy key
    - Copy the test script to the repository
    - Execute the test script
    - Parse the output for test results and performance metrics
@@ -298,10 +284,7 @@ To run the grader automatically at regular intervals without administrator privi
 
 3. Make sure to:
    - Use absolute paths for both the grader directory and the `uv` executable
-   - Export the `GH_PAT` environment variable in the cron job if not using the config file:
-     ```cron
-     0 2 * * * cd /path/to/grader && GH_PAT="github_pat_xxxxx" /usr/bin/uv run main.py >> /path/to/grader/cron.log 2>&1
-     ```
+   - Use an absolute path for `worker_private_key` in `grader-config.yaml`, or keep it relative to the grader directory the job `cd`s into
 
 ### Option 2: Using Systemd User Timer
 
@@ -311,12 +294,11 @@ Systemd user timers don't require root privileges and offer more control.
 
    ```ini
    [Unit]
-   Description=GitHub Classroom Autograder
+   Description=MCPGrader
    
    [Service]
    Type=oneshot
    WorkingDirectory=/path/to/grader
-   Environment="GH_PAT=github_pat_xxxxx"
    ExecStart=/usr/bin/uv run main.py
    
    [Install]
@@ -327,7 +309,7 @@ Systemd user timers don't require root privileges and offer more control.
 
    ```ini
    [Unit]
-   Description=Run GitHub Classroom Autograder daily
+   Description=Run MCPGrader daily
    
    [Timer]
    OnCalendar=daily
@@ -394,7 +376,7 @@ The grader produces a JSON file (specified in `grades_file`) with the following 
 {
   "assignment-name": [
     {
-      "name": "Student Name",
+      "name": "123456",
       "commit_hash": "abc1234",
       "status": "graded",
       "error": "",
@@ -412,7 +394,7 @@ The grader produces a JSON file (specified in `grades_file`) with the following 
 
 **Field Descriptions:**
 
-- **`name`**: Student name(s) associated with the submission
+- **`name`**: The student ID from the worker submission
 - **`commit_hash`**: Git commit hash (first 7 characters) of the graded submission
 - **`status`**: Grading status (`"graded"` or `"error"`)
 - **`error`**: Error message if status is `"error"`, empty otherwise
@@ -424,9 +406,14 @@ The grader produces a JSON file (specified in `grades_file`) with the following 
 
 ## Troubleshooting
 
-**Issue: "GitHub Personal Access Token (PAT) not provided"**
-- Make sure you've set the `GH_PAT` environment variable or added `github_pat` to the config file
-- Verify the token has the correct permissions
+**Issue: "Grader worker request ... failed (401)"**
+- The grader machine's clock is more than 60 seconds off. Sync it (e.g. with NTP).
+
+**Issue: "Grader worker request ... failed (403)"**
+- `worker_private_key` isn't authorized on the worker. Run `scripts/admin-keys.sh list` in the worker repository and `push` the key.
+
+**Issue: "Failed to get commit hash for submission ..."**
+- The deploy key was rejected, or the repository URL is wrong. Check that the student added the public key under **Settings → Deploy keys** of that exact repository that the worker returned for it.
 
 **Issue: "working_dir does not exist"**
 - Create the directory specified in `working_dir` before running: `mkdir -p /tmp/grader`
