@@ -6,6 +6,8 @@ import os
 from os import path
 from aggregation import AGG_NAME_TO_CLASS
 
+JOB_MODES = ("per_task", "per_submission")
+
 @dataclass_json
 @dataclass
 class SlurmBackendConfig:
@@ -103,6 +105,8 @@ class GraderConfig:
     worker_url: str # base URL of the grader Cloudflare Worker
     worker_private_key: str # path to the ECDSA P-256 admin key (PEM) used to sign worker requests
     sentry_dsn: Optional[str] = None
+    max_submitted_jobs: int = -1 # at most this many grading jobs queued or running at once; -1 = no limit
+    job_mode: str = "per_task" # "per_task": one job per task; "per_submission": one job per (student, task)
 
     def assert_valid(self) -> None:
         assert isinstance(self.working_dir, str) and self.working_dir, "working_dir must be a non-empty string"
@@ -111,6 +115,8 @@ class GraderConfig:
         assert isinstance(self.worker_url, str) and self.worker_url.startswith(("https://", "http://")), "worker_url must be an http(s) URL"
         assert isinstance(self.worker_private_key, str) and self.worker_private_key, "worker_private_key must be a non-empty string"
         assert path.exists(self.worker_private_key), f"worker_private_key {self.worker_private_key} does not exist"
+        assert isinstance(self.max_submitted_jobs, int) and (self.max_submitted_jobs == -1 or self.max_submitted_jobs >= 1), "max_submitted_jobs must be -1 (no limit) or a positive integer"
+        assert self.job_mode in JOB_MODES, f"job_mode must be one of {JOB_MODES}"
 
 
 @dataclass_json

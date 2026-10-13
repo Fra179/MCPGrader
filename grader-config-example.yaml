@@ -4,6 +4,8 @@ grader:
   worker_url: "https://grader-api.example.com"
   worker_private_key: "keys/grader.key" # admin key authorized in the worker's ADMIN_PUBLIC_KEYS
   sentry_dsn: ""
+  max_submitted_jobs: -1 # jobs queued or running at once; -1 = no limit
+  job_mode: "per_task" # or "per_submission": one job per (student, task)
 
 pusher:
   github_repo: "user/MCPLeaderboard"
@@ -36,6 +38,7 @@ assignments:
         blocking: true
         test_script_path: "./test_scripts/test_vectorsum_gpu.sh"
         submission_timeout: 300 # seconds per student; omit for no limit
+        reduction: "median" # how the reported times become avg_runtime: "mean" (default) or "median"
         slurm_backend:
           config:
             slurm_partition: "gpu"

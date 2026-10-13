@@ -73,15 +73,19 @@ grader:
   worker_url: "https://grader-api.example.com"
   worker_private_key: "keys/grader.key"
   sentry_dsn: ""
+  max_submitted_jobs: -1
+  job_mode: "per_task"
 ```
 
 **Field Explanations:**
 
 - **`working_dir`**: Directory where student repositories will be cloned. This directory must exist before running the grader.
-- **`grades_file`**: Path to the output JSON file containing all grading results and the leaderboard.
+- **`grades_file`**: Path to the output JSON file containing all grading results and the leaderboard. It's rewritten on every run from `<working_dir>/grading_state.json`, where the grader keeps every student's latest result together with the commit and task configuration it was graded with. Don't edit the grades file by hand: changes are overwritten. Deleting `grading_state.json` makes the next run regrade everyone.
 - **`worker_url`** (required): Base URL of the grader worker.
 - **`worker_private_key`** (required): Path to the ECDSA P-256 admin private key (PEM) used to sign requests to the worker. This file must exist before running the grader. See [Admin Key](#admin-key).
 - **`sentry_dsn`**: (Optional) Sentry DSN for error tracking and monitoring. Leave empty if not using Sentry.
+- **`max_submitted_jobs`** (default: `-1`, no limit): At most this many grading jobs are queued or running on the cluster at once, across all tasks and assignments. Extra jobs wait in the grader and are submitted as earlier ones finish, so the cluster's per-user job limit isn't hit. It only counts the grader's own jobs: if the same user submits other jobs, leave some margin. A job the cluster still refuses is logged, and its students are retried on the next run.
+- **`job_mode`** (default: `"per_task"`): `"per_task"` grades all of a task's updated submissions one after another in a single job; `"per_submission"` launches one job per (student, task) for maximum parallelism. With `"per_submission"`, a task's `timeout_min` must cover a single student instead of all of them, and you'll usually want `max_submitted_jobs` set.
 
 ### Step 3: Configure the Pusher Section
 
@@ -140,7 +144,8 @@ assignments:
         skip: false
         blocking: true
         test_script_path: "./test_scripts/test_vectorsum_gpu.sh"
-        
+        reduction: "median"
+
         slurm_backend:
           config:
             slurm_partition: "gpu"
@@ -170,7 +175,9 @@ assignments:
 
 - **`test_script_path`** (required): Absolute or relative path to the test script that will be executed in each student's repository for this task.
 
-- **`submission_timeout`** (default: no limit): Seconds a single student's test script may run. On timeout the script's whole process group (including `make`, `srun` and the student's program) gets SIGTERM, then SIGKILL 5 s later, and the result is recorded with status `timeout`. All of a task's submissions are graded one after another in a single SLURM job, so `timeout_min` should cover the number of updated submissions times this value.
+- **`submission_timeout`** (default: no limit): Seconds a single student's test script may run. On timeout the script's whole process group (including `make`, `srun` and the student's program) gets SIGTERM, then SIGKILL 5 s later, and the result is recorded with status `timeout`. With `job_mode: "per_task"` all of a task's submissions are graded one after another in a single SLURM job, so `timeout_min` should cover the number of updated submissions times this value; with `"per_submission"` it only needs to cover one.
+
+- **`reduction`** (default: `"mean"`): How the list of times a test script reports (`"times"` in its JSON output) becomes the task's `avg_runtime` in the leaderboard: `"mean"` or `"median"`. The median is less sensitive to a single slow run. It only affects `avg_runtime`. Changing it regrades every submission of the task, like any change to the task's configuration.
 
 >### [!] Important [!]
 >When writing your test script don't forget to launch the student's script with either `srun`, `mpirun` or a similar command that will also schedule the process on the cluster!
@@ -248,13 +255,13 @@ The grader will:
 1. Read the configuration file
 2. For each assignment (unless skipped):
    - Read student submissions for the assignment from the grader worker
-   - Skip repositories whose latest commit was already graded
+   - Skip repositories whose latest commit was already graded with the task's current configuration
    - Clone each student's repository with their deploy key
    - Copy the test script to the repository
    - Execute the test script
    - Parse the output for test results and performance metrics
    - Clean up (unless `preserve_repo_files` is true)
-3. Save all results to the `grades_file`
+3. Record the results in `<working_dir>/grading_state.json`, then write the leaderboard to the `grades_file`
 
 ## Setting Up as a Recurrent Task
 
