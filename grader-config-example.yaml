@@ -6,6 +6,7 @@ grader:
   sentry_dsn: ""
   max_submitted_jobs: -1 # jobs queued or running at once; -1 = no limit
   job_mode: "per_task" # or "per_submission": one job per (student, task)
+  wait_for_jobs: true # false = one pass and exit, the next run records the results (for runs on a schedule)
 
 pusher:
   github_repo: "user/MCPLeaderboard"

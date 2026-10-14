@@ -4,20 +4,15 @@ from config.configs import AssignmentTaskConfig
 
 class ABRunner(ABC):
     @abstractmethod
-    def run(self, grading_function: Callable[..., Any], task: AssignmentTaskConfig, *args, **kwargs) -> int:
+    def submit(self, grading_function: Callable[..., Any], task: AssignmentTaskConfig, *args, **kwargs) -> str:
         """Submit grading_function(*args, **kwargs) as a job and return its id; task only supplies its
-        scheduling parameters. Submission may be deferred until wait/wait_all (e.g. by a job limit)."""
-        raise NotImplementedError()
-    
-    @abstractmethod
-    def wait_all(self) -> None:
-        raise NotImplementedError()
-    
-    @abstractmethod
-    def wait(self, jobid: int) -> None:
+        scheduling parameters. Raises if the job couldn't be submitted."""
         raise NotImplementedError()
 
     @abstractmethod
-    def collect_results(self, jobid: int) -> Any:
-        """Return value of the job's function; raises if the job failed."""
+    def finished_jobs(self, job_ids: list[str]) -> dict[str, str]:
+        """Final state of each of these jobs that has finished ("COMPLETED", "FAILED", ...; "FINISHED" if
+        the exit status is unknown; "UNKNOWN" if the scheduler doesn't know the job, which can briefly
+        happen right after submitting it). Jobs still queued or running are left out. Works for jobs
+        submitted by an earlier process too. Raises if the states can't be retrieved."""
         raise NotImplementedError()

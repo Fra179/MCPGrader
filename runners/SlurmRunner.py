@@ -1,38 +1,28 @@
 from .ABRunner import ABRunner
 from config.configs import AssignmentTaskConfig
-import logging
-import time
-from collections import deque
-from dataclasses import dataclass
+import os
+import subprocess
 import submitit
 from submitit import Job
 from typing import Any, Callable
 
-@dataclass
-class _QueuedJob:
-    jobid: int
-    function: Callable[..., Any]
-    parameters: dict[str, Any]  # submitit parameters, applied when the job is actually submitted
-    args: tuple
-    kwargs: dict[str, Any]
+# sacct states of a job that hasn't finished yet; any other state is final. A state missing from
+# this list makes the grader stop tracking the job early, which at worst grades a submission twice
+ACTIVE_STATES = {
+    "PENDING", "CONFIGURING", "RUNNING", "COMPLETING", "SUSPENDED", "REQUEUED", "REQUEUE_FED",
+    "REQUEUE_HOLD", "RESIZING", "SIGNALING", "STAGE_OUT", "STOPPED",
+}
 
 class SlurmRunner(ABRunner):
-    """Submits jobs through submitit, keeping at most max_submitted_jobs queued or running at once
-    (-1 = no limit). Jobs over the limit wait in a local queue and are submitted by wait/wait_all
-    as earlier jobs finish, so the cluster's per-user job limit is never hit."""
+    """Submits jobs through submitit and reads their states back with sacct, so a later process can
+    tell when an earlier one's jobs are done. Without SLURM, submitit runs jobs as local processes."""
 
-    def __init__(self, logs_folder: str = "./logs", max_submitted_jobs: int = -1, poll_interval: float = 30.0):
+    def __init__(self, logs_folder: str = "./logs"):
         super().__init__()
         self.executor = submitit.AutoExecutor(folder=logs_folder)
-        self.max_submitted_jobs = max_submitted_jobs
-        self.poll_interval = poll_interval
-        self.jobs: list[Job | None] = []  # by job id; None until submitted
-        self.queue: deque[_QueuedJob] = deque()
-        self.active: set[int] = set()  # submitted and not finished yet
-        self.submit_errors: dict[int, Exception] = {}
-        self.log = logging.getLogger("grader.runner")
+        self.jobs: dict[str, Job] = {}  # submitted by this process
 
-    def run(self, grading_function: Callable[..., Any], task: AssignmentTaskConfig, *args, **kwargs) -> int:
+    def submit(self, grading_function: Callable[..., Any], task: AssignmentTaskConfig, *args, **kwargs) -> str:
         config = task.slurm_backend.config.copy()
 
         if not config.get("slurm_job_name"):
@@ -41,58 +31,43 @@ class SlurmRunner(ABRunner):
         config["slurm_use_srun"] = False  # We are already running inside a SLURM job
 
         # task only supplies the SLURM parameters; the function gets just args/kwargs
-        jobid = len(self.jobs)
-        self.jobs.append(None)
-        self.queue.append(_QueuedJob(jobid, grading_function, config, args, kwargs))
-        self._submit_queued()
-        return jobid
+        self.executor.update_parameters(**config)
+        job = self.executor.submit(grading_function, *args, **kwargs)
+        self.jobs[job.job_id] = job
+        return job.job_id
 
-    def _submit_queued(self) -> None:
-        self.active = {jobid for jobid in self.active if not self.jobs[jobid].done()}
+    def finished_jobs(self, job_ids: list[str]) -> dict[str, str]:
+        if not job_ids:
+            return {}
+        if self.executor.cluster == "slurm":
+            return self._finished_slurm_jobs(job_ids)
+        return self._finished_local_jobs(job_ids)
 
-        while self.queue and (self.max_submitted_jobs == -1 or len(self.active) < self.max_submitted_jobs):
-            queued = self.queue.popleft()
+    def _finished_slurm_jobs(self, job_ids: list[str]) -> dict[str, str]:
+        # -X: one line per job (its allocation), not per step
+        out = subprocess.run(
+            ["sacct", "-X", "-n", "-P", "-o", "JobID,State", "-j", ",".join(job_ids)],
+            capture_output=True, text=True, check=True, timeout=120,
+        ).stdout
+
+        states = {job_id: "UNKNOWN" for job_id in job_ids}
+        for line in out.splitlines():
+            job_id, _, state = line.partition("|")
+            if job_id in states:
+                states[job_id] = state.split()[0] if state else "UNKNOWN"  # "CANCELLED by 1234"
+        return {job_id: state for job_id, state in states.items() if state not in ACTIVE_STATES}
+
+    def _finished_local_jobs(self, job_ids: list[str]) -> dict[str, str]:
+        """Local executor (no SLURM, for testing): the job id is the job's pid."""
+        finished = {}
+        for job_id in job_ids:
+            job = self.jobs.get(job_id)
+            if job is not None:  # our child: os.kill would still see it until it's reaped
+                if job.done():
+                    finished[job_id] = "FAILED" if job.exception() is not None else "COMPLETED"
+                continue
             try:
-                self.executor.update_parameters(**queued.parameters)
-                self.jobs[queued.jobid] = self.executor.submit(queued.function, *queued.args, **queued.kwargs)
-                self.active.add(queued.jobid)
-            except Exception as e:
-                # e.g. sbatch refused it; reported by collect_results, retried on the next run
-                self.log.error("Failed to submit job %d: %s", queued.jobid, str(e))
-                self.submit_errors[queued.jobid] = e
-
-        if self.queue:
-            self.log.debug("%d jobs submitted, %d queued locally", len(self.active), len(self.queue))
-
-    def _finished(self, jobid: int) -> bool:
-        job = self.jobs[jobid]
-        return jobid in self.submit_errors or (job is not None and job.done())
-
-    def wait_all(self) -> None:
-        while True:
-            self._submit_queued()
-            if not self.queue and all(self._finished(jobid) for jobid in range(len(self.jobs))):
-                return
-            time.sleep(self.poll_interval)
-
-    def wait(self, jobid: int) -> None:
-        while True:
-            self._submit_queued()
-            if self._finished(jobid):
-                return
-            time.sleep(self.poll_interval)
-
-    def collect_results(self, jobid: int) -> Any:
-        if jobid in self.submit_errors:
-            raise RuntimeError(f"job was never submitted: {self.submit_errors[jobid]}")
-
-        job = self.jobs[jobid]
-        if job is None:
-            raise RuntimeError("job was never submitted")
-
-        # You shouldn't access private members of a class like this
-        # but I need to "hack" the library in such a way that id doesn't
-        # parse jobs results past rank #0
-        sub_job = job._sub_jobs[0] if job._sub_jobs else job
-
-        return sub_job.results()[0] # Only the first rank executes the scripts
+                os.kill(int(job_id), 0)
+            except (ProcessLookupError, PermissionError):  # gone, or pid reused by another user
+                finished[job_id] = "FINISHED"  # an earlier process's job: its exit status is lost
+        return finished

@@ -25,6 +25,9 @@ class SubmissionGrader:
 
     def __init__(self, task: AssignmentTaskConfig, workdir: Path, preserve_repo_files: bool, log_level: int) -> None:
         self.task = task
+        # Computed here, in the main process: the result must carry the configuration the job was
+        # submitted with, even if the test script changes before the result is recorded
+        self.perf_hash = task.performance_hash()
         self.workdir = workdir
         self.preserve_repo_files = preserve_repo_files
         self.log_level = log_level
@@ -138,6 +141,7 @@ class SubmissionGrader:
             "runtimes": runtimes,
             "data": data,
             "repo_url": submission.ssh_url,
+            "perf_hash": self.perf_hash,
         }
 
     def _run_test_script(self, script: Path, cwd: Path) -> tuple[int | None, str, str]:

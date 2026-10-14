@@ -37,7 +37,8 @@ This grading system automates the process of:
 - **SLURM Support**: Execute test scripts with configurable SLURM resources (CPU, memory, GPUs, etc.)
 - **Performance Metrics**: Collects runtime statistics from test scripts
 - **Incremental Grading**: Only re-grades repositories whose latest commit changed since the last run
-- **Blocking/Non-blocking Execution**: Control whether to wait for assignment completion
+- **Blocking Tasks**: Hold back an assignment's later tasks until a task is fully graded
+- **Restartable Runs**: A run can be killed at any point; the next one picks up the jobs and results it left
 - **Repository Cleanup**: Option to preserve or delete cloned repositories
 - **Leaderboard Generation**: JSON output with all results and metrics
 - **GitHub Integration**: Push leaderboard results directly to a GitHub repository
@@ -75,6 +76,7 @@ grader:
   sentry_dsn: ""
   max_submitted_jobs: -1
   job_mode: "per_task"
+  wait_for_jobs: true
 ```
 
 **Field Explanations:**
@@ -84,8 +86,9 @@ grader:
 - **`worker_url`** (required): Base URL of the grader worker.
 - **`worker_private_key`** (required): Path to the ECDSA P-256 admin private key (PEM) used to sign requests to the worker. This file must exist before running the grader. See [Admin Key](#admin-key).
 - **`sentry_dsn`**: (Optional) Sentry DSN for error tracking and monitoring. Leave empty if not using Sentry.
-- **`max_submitted_jobs`** (default: `-1`, no limit): At most this many grading jobs are queued or running on the cluster at once, across all tasks and assignments. Extra jobs wait in the grader and are submitted as earlier ones finish, so the cluster's per-user job limit isn't hit. It only counts the grader's own jobs: if the same user submits other jobs, leave some margin. A job the cluster still refuses is logged, and its students are retried on the next run.
+- **`max_submitted_jobs`** (default: `-1`, no limit): At most this many grading jobs are queued or running on the cluster at once, across all tasks and assignments. Extra jobs are submitted by later passes as earlier ones finish (by the next run, with `wait_for_jobs: false`), so the cluster's per-user job limit isn't hit. Jobs from earlier runs that are still in flight count too. It only counts the grader's own jobs: if the same user submits other jobs, leave some margin. A job the cluster still refuses is logged, and its students are retried on the next run.
 - **`job_mode`** (default: `"per_task"`): `"per_task"` grades all of a task's updated submissions one after another in a single job; `"per_submission"` launches one job per (student, task) for maximum parallelism. With `"per_submission"`, a task's `timeout_min` must cover a single student instead of all of them, and you'll usually want `max_submitted_jobs` set.
+- **`wait_for_jobs`** (default: `true`): The grader works in passes: each pass records the results written so far, forgets jobs that have finished, and submits jobs for submissions that need grading. With `true`, a run repeats passes every 30 seconds until no job is in flight and nothing is left to submit. With `false`, a run makes a single pass and exits without waiting for its jobs: the next run records their results. Either way, the leaderboard is written (and pushed) once, when the run ends. Use `false` when the grader is started on a schedule, e.g. every 10 minutes.
 
 ### Step 3: Configure the Pusher Section
 
@@ -171,7 +174,7 @@ assignments:
 
 - **`skip`** (default: `false`): If `true`, this task will be skipped during grading.
 
-- **`blocking`** (default: `false`): If `true`, the grader will wait for this task's execution to complete before proceeding to the next task. Useful for sequential processing or when tasks have dependencies.
+- **`blocking`** (default: `false`): If `true`, the assignment's later tasks aren't submitted while this task still has jobs in flight or jobs waiting for `max_submitted_jobs` (or jobs the cluster refused); a later pass or run submits them once those are done. Useful when tasks shouldn't compete for the cluster or when later tasks depend on earlier ones.
 
 - **`test_script_path`** (required): Absolute or relative path to the test script that will be executed in each student's repository for this task.
 
@@ -251,17 +254,24 @@ uv run main.py
 python main.py
 ```
 
-The grader will:
-1. Read the configuration file
-2. For each assignment (unless skipped):
+The grader works in passes (see `wait_for_jobs`). In each pass it will:
+1. Forget the grading jobs that have finished, and record every result file jobs have written so far in `<working_dir>/grading_state.json`, including those of jobs started by an earlier run
+2. For each assignment (unless skipped), submit grading jobs, up to `max_submitted_jobs` in flight:
    - Read student submissions for the assignment from the grader worker
-   - Skip repositories whose latest commit was already graded with the task's current configuration
+   - Skip repositories whose latest commit was already graded with the task's current configuration, or that a job in flight is grading
    - Clone each student's repository with their deploy key
    - Copy the test script to the repository
    - Execute the test script
    - Parse the output for test results and performance metrics
    - Clean up (unless `preserve_repo_files` is true)
-3. Record the results in `<working_dir>/grading_state.json`, then write the leaderboard to the `grades_file`
+
+When the run ends, it writes the leaderboard to the `grades_file` and pushes it (the push is skipped if the leaderboard didn't change).
+
+Submissions and their latest commits are read once per run; commits pushed later are picked up by the next run. The jobs in flight are kept in `grading_state.json`, so a run killed at any point loses nothing: the next one waits for those jobs and records their results instead of grading the same students again.
+
+Only one run at a time works on a `working_dir`: a run holds a lock on `<working_dir>/grader.lock` until it ends, and a run started meanwhile logs who holds it and exits, so a schedule can start the grader as often as it likes. The lock is released when the run ends or dies, even with `kill -9` or at a SLURM time limit. At startup, `main.py` checks that locking works in `working_dir` and, on Lustre or NFS, that locks are shared across nodes; it refuses to run otherwise.
+
+A submission whose grading jobs end 3 times without producing its result (the job crashed, was killed or hit `timeout_min`, or the repository couldn't be cloned) gets an `error` result instead of another job. A new commit or a change to the task tries again.
 
 ## Setting Up as a Recurrent Task
 

@@ -107,6 +107,7 @@ class GraderConfig:
     sentry_dsn: Optional[str] = None
     max_submitted_jobs: int = -1 # at most this many grading jobs queued or running at once; -1 = no limit
     job_mode: str = "per_task" # "per_task": one job per task; "per_submission": one job per (student, task)
+    wait_for_jobs: bool = True # repeat passes until every job is done; false = one pass, for runs started on a schedule
 
     def assert_valid(self) -> None:
         assert isinstance(self.working_dir, str) and self.working_dir, "working_dir must be a non-empty string"
@@ -117,6 +118,7 @@ class GraderConfig:
         assert path.exists(self.worker_private_key), f"worker_private_key {self.worker_private_key} does not exist"
         assert isinstance(self.max_submitted_jobs, int) and (self.max_submitted_jobs == -1 or self.max_submitted_jobs >= 1), "max_submitted_jobs must be -1 (no limit) or a positive integer"
         assert self.job_mode in JOB_MODES, f"job_mode must be one of {JOB_MODES}"
+        assert isinstance(self.wait_for_jobs, bool), "wait_for_jobs must be a boolean"
 
 
 @dataclass_json
