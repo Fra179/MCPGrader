@@ -4,9 +4,10 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 ## Commands
 
-Python >=3.14, managed with `uv`. There is no test suite or linter configured.
+Python >=3.14, managed with `uv`. Regression checks use standard-library `unittest`; no linter is configured.
 
 - `uv sync` — install dependencies
+- `uv run python -m unittest discover -s tests -v` — run the local regression checks (local Git repositories, no worker or SLURM required)
 - `uv run main.py` — run the grader (reads `grader-config.yaml` from the cwd; copy from `grader-config-example.yaml`)
 - `uv run python -m grader_worker.GraderWorkerApi <worker URL> <admin key file> [assignment]` — sanity-check the worker URL and admin key by printing submissions
 
@@ -22,8 +23,8 @@ The grader works in **passes** (`Grader._pass`); `grader.wait_for_jobs` (default
 
 1. `_drop_finished_jobs`: asks `runner.finished_jobs` ([runners/SlurmRunner.py](runners/SlurmRunner.py): one `sacct -X` call; locally, the job's pid) about every job in the grading state, logs those that didn't end `COMPLETED`, and removes them. A job `sacct` doesn't know yet (`UNKNOWN`) stays in flight for `UNKNOWN_JOB_GRACE` (10 min) after submission; if `sacct` fails, every job stays in flight for this pass.
 2. `_ingest_results`: reads every result file under `<working_dir>/results/<assignment>/<task>/` (written by jobs still running, finished, or started by an earlier run), `record`s each into the grading state with the file's `perf_hash`, saves the grading state (`<working_dir>/grading_state.json`, atomic) and only then deletes the files (a crash in between just records them again). Files without `perf_hash` (older format) are discarded, so those students are regraded. Runs after step 1, so a finished job's files are complete when read.
-3. `_submit_assignment`, per assignment: the first pass of a run takes a snapshot (`_snapshot`): `GraderWorkerAPI` ([grader_worker/](grader_worker/)) lists submissions from the grader Cloudflare Worker (`POST /submissions` with `assignment_name` = the assignment's `name`; requests are signed with the ECDSA P-256 admin key in `worker_private_key`, raw `r||s` signature over `METHOD\npath\ntimestamp\nsha256(body)`, 60 s of clock skew allowed; it returns the normalized `repo_ssh_url` and the generated private deploy key), and `git ls-remote HEAD` is run once per submission with its deploy key. Later passes of the same run reuse it. For each task, a submission needs grading if `GradingState.needs_grading` ([grader/grading_state.py](grader/grading_state.py)) says so (no record for that task with the same commit, the same repo URL and the task's current `performance_hash()`) and no job in flight already covers that student and task. `grader.job_mode` splits a task's updated submissions: `per_task` (default) puts them all in one job, `per_submission` gives each its own job. Jobs are submitted while fewer than `max_submitted_jobs` are in flight (counting earlier runs' jobs); the rest are deferred to a later pass, so nothing is queued in memory. Each submitted job is added to the grading state and saved right away. A job `sbatch` refuses is logged and left for the next run (it doesn't keep a waiting run going). `blocking`: while a blocking task has jobs in flight, deferred or refused, the assignment's later tasks aren't submitted (they're still checked, and logged as waiting). **Attempt cap:** each submitted job adds an attempt per student (`GradingState.attempts`, keyed by commit and `perf_hash`, so a new commit or task change resets it; `record` clears it). With `MAX_GRADING_ATTEMPTS` (3) reached, `_give_up_if_exhausted` records an `error` result instead of submitting, or, if the commit is unknown (`ls-remote` failed), only skips the student. Without the cap, a waiting run would resubmit a student whose job always dies every pass, forever.
-4. Inside the job (`SubmissionGrader.grade_all`, [grader/submission_grader.py](grader/submission_grader.py), one instance per task, submitted by `SlurmRunner.submit` via `submitit` with the task's `slurm_backend.config` as parameters), only SLURM rank 0 works. Each repo is cloned over SSH with the student's deploy key (`deploy_key_env` in [grader/utils.py](grader/utils.py) writes it to a 0600 temp file and sets `GIT_SSH_COMMAND`), the task's test script is copied in and run in its own process group (the group is killed after the task's `submission_timeout`, giving status `timeout`), and the **last stdout line** is parsed as JSON (`{"passed", "total", "times"}`). Each result is written atomically to `<working_dir>/results/<assignment>/<task>/<student_id>.json` as soon as it's ready, and the clone is deleted right after unless `preserve_repo_files`; the job returns nothing. Each result carries the `perf_hash` its job was submitted with (`SubmissionGrader` computes it in the main process).
+3. `_submit_assignment`, per assignment: the first pass of a run takes a snapshot (`_snapshot`): `GraderWorkerAPI` ([grader_worker/](grader_worker/)) lists submissions from the grader Cloudflare Worker (`POST /submissions` with `assignment_name` = the assignment's `name`; requests are signed with the ECDSA P-256 admin key in `worker_private_key`, raw `r||s` signature over `METHOD\npath\ntimestamp\nsha256(body)`, 60 s of clock skew allowed; it returns the normalized `repo_ssh_url` and the generated private deploy key), and `git ls-remote HEAD` resolves each submission with its deploy key (up to 3 attempts on failure). Successful hashes remain fixed for the run; unresolved submissions are skipped and their lookups retried on later passes or runs. For each task, a submission needs grading if `GradingState.needs_grading` ([grader/grading_state.py](grader/grading_state.py)) says so (no record for that task with the same commit, the same repo URL and the task's current `performance_hash()`) and no job in flight already covers that student and task. `grader.job_mode` splits a task's updated submissions: `per_task` (default) puts them all in one job, `per_submission` gives each its own job. Jobs are submitted while fewer than `max_submitted_jobs` are in flight (counting earlier runs' jobs); the rest are deferred to a later pass, so nothing is queued in memory. Each submitted job is added to the grading state and saved right away. A job `sbatch` refuses is logged and left for the next run (it doesn't keep a waiting run going). `blocking`: while a blocking task has jobs in flight, deferred or refused, the assignment's later tasks aren't submitted (they're still checked, and logged as waiting). **Attempt cap:** each submitted job adds an attempt per student (`GradingState.attempts`, keyed by commit and `perf_hash`, so a new commit or task change resets it; `record` clears it). With `MAX_GRADING_ATTEMPTS` (3) reached, `_give_up_if_exhausted` records an `error` result instead of submitting, rather than trying indefinitely. Submissions with an unresolved HEAD are not submitted and consume no grading attempts. Without the cap, a waiting run would resubmit a student whose job always dies every pass, forever.
+4. Inside the job (`SubmissionGrader.grade_all`, [grader/submission_grader.py](grader/submission_grader.py), one instance per task, submitted by `SlurmRunner.submit` via `submitit` with the task's `slurm_backend.config` as parameters), only SLURM rank 0 works. Each repo is cloned and explicitly checked out at its snapshotted commit (fetched separately if needed), over SSH with the student's deploy key (`deploy_key_env` in [grader/utils.py](grader/utils.py) writes it to a 0600 temp file and sets `GIT_SSH_COMMAND`), the task's test script is copied in and run in its own process group (the group is killed after the task's `submission_timeout`, giving status `timeout`), and the **last stdout line** is parsed as JSON (`{"passed", "total", "times"}`). Each result is written atomically to `<working_dir>/results/<assignment>/<task>/<student_id>.json` as soon as it's ready, and the clone is deleted right after unless `preserve_repo_files`; the job returns nothing. Each result carries the `perf_hash` its job was submitted with (`SubmissionGrader` computes it in the main process).
 5. `_publish`, once per run, after the last pass (not part of `_pass`): writes `grades_file` as `grading_state.export_leaderboard(config)`, then optionally pushes it via `pusher/github_pusher.py` (the only place a GitHub token is used; it skips the commit if the file in the repo is identical, which it can't check above 1 MB). A job that fails or times out only loses the submission it was grading: the results it wrote are recorded, and students without one are graded again.
 
 Things that span files:
@@ -31,7 +32,7 @@ Things that span files:
 - **Regrading**: `AssignmentTaskConfig.performance_hash()` (task name, script path *and contents*, SLURM config, reduction, submission_timeout) at submission time is stored in each record (a result graded with an older script is recorded as such, and regraded); when it changes, every submission of that task is regraded (old results stay on the leaderboard until replaced).
 - **Aggregations**: `aggregation/` holds `ABAggregation` subclasses registered in `AGG_NAME_TO_CLASS` (`mean`, `median`). A task's optional `reduction` selects one; `export_leaderboard` looks it up in the current config (mean if unset or the task is gone) to compute per-task `avg_runtime`. Neither result files nor grading state records store it. New aggregations must be added to `AGGS_LIST`.
 - **Result shape**: the leaderboard JSON is per assignment, one entry per student with per-task sub-dicts (`commit_hash`, `status`, `error`, `stdout`, `runtimes`, `avg_runtime`, `data`, `reduction`, plus `name` and `tasks`), the same format the removed `GradeResult` produced. Keep it stable: it's the file pushed to the leaderboard repo. README's "Output Format" section is outdated in this respect.
-- The job is a bound method of `SubmissionGrader`, which holds only data (task config, working dir, flags), so only that and the job's arguments (submissions with their deploy keys, results dir) land in `slurm_logs/*_submitted.pkl`, never `Grader` or its config (GitHub PAT). Don't submit bound methods of `Grader`, and don't give `SubmissionGrader` references to config or `Grader` state. `slurm_logs/` is chmod 0700.
+- The job is a bound method of `SubmissionGrader`, which holds only data (task config, working dir, flags), so only that and the job's arguments (submissions with their deploy keys, results dir, snapshotted commit hashes) land in `slurm_logs/*_submitted.pkl`, never `Grader` or its config (GitHub PAT). Don't submit bound methods of `Grader`, and don't give `SubmissionGrader` references to config or `Grader` state. `slurm_logs/` is chmod 0700.
 
 Note: the old `gh/` (GitHub API) and `google_form/` (Google Forms) submission sources were removed in favor of `grader_worker/`.
 
@@ -96,12 +97,20 @@ Rules for migrated test scripts:
 - runs must call `srun ... $GRADER_SANDBOX ./binary` directly, not `make run_*`: the student's binary can rewrite the Makefile between runs
 - always use `make -f Makefile`, since a student-added `GNUmakefile` takes precedence
 
+Done (uncommitted), independent of the feasibility result: `SubmissionGrader._grade_cloned` unlinks the grading-script destination before copying, replacing student-committed symlinks without changing their targets. Regression checks cover both existing and missing targets, including target contents and permissions.
+
 Do now, independent of the feasibility result (agreed, not done):
 
-- In `SubmissionGrader._grade_cloned`, `copyfile` onto `grading_script_dest` follows a symlink a student commits under that name, overwriting an arbitrary file of the grader's user (and `chmod` follows it too). Fix: `grading_script_dest.unlink(missing_ok=True)` before copying.
 - Keep the worker admin key and `grader-config.yaml` where compute nodes can't read them. Only the main process needs them; on Leonardo, `$HOME`, `$WORK` and `$SCRATCH` are all visible from compute nodes.
 
 Not solved by containers: the result is the last stdout line, which student processes can forge (e.g. a background process started by `make` printing JSON). Fixing that needs a different contract, such as the test script writing the result to a file the student can't write.
+
+### Pin grading jobs to the submission snapshot (implemented, uncommitted)
+
+- `_submit_task` passes a per-batch map of repo URLs to snapshotted commit hashes to `SubmissionGrader.grade_all`. Jobs explicitly check out that commit, fetching it first if the clone doesn't contain it. An unavailable commit fails grading rather than falling back to HEAD.
+- HEAD lookups get up to three attempts before submission. Unresolved submissions are skipped and retried on later passes or runs; they don't keep a waiting run alive on their own. Successful lookups remain fixed across all tasks for the run.
+- Jobs pickled before this change may still call `grade_all` without the commit map; only those legacy jobs retain the previous HEAD behavior.
+- Verified with local Git repositories: pushes between snapshot and clone, both job modes, blocking tasks grading the same commit, later runs picking up new commits, transient and persistent HEAD lookup failures, explicit fetching after branch history is replaced, and unavailable commits reaching the grading-attempt cap. Also checked with submitit's local executor that the commit map survives job serialization and the run settles and publishes. Not tested on Leonardo.
 
 ### TODO: run artifacts uploaded to the worker (planned, not started)
 
@@ -129,11 +138,40 @@ Assume the worker will provide this endpoint (it doesn't exist yet; `../grader-w
 
 With containers, `GRADER_ARTIFACTS_DIR` needs one more `--bind`. Full stdout/stderr could also be added to the archive automatically; that would cover the private-results improvement below.
 
+### TODO: avoid clone-directory collisions (not urgent)
+
+- Replace the repository-name flattening in `SubmissionGrader.repo_dir` with a collision-resistant directory identity, such as the worker submission UUID plus task identity. Distinct repositories like `course_group/solution` and `course/group_solution` currently map to the same directory for the same task.
+- Verify that such repositories use separate clone directories and that one job's cleanup cannot remove the other's clone.
+
 ### TODO comments in the code (agreed, deferred)
 
 - `submission_grader.py`: exit-code contract (0 graded, 1 student failure, 2 infrastructure failure); don't cache 2.
 - `grader.py`: deploy keys stay in submitit's pickles.
 - `grading_state.py`: drop students no longer in the worker and tasks no longer in the config (in `export_leaderboard`); SQLite instead of the JSON file, same interface (no immediate need; Leonardo's Lustre has coherent `flock` so SQLite's locking works, but not WAL mode).
+
+### Architecture discussion to resume (saved 2026-10-15; proposals, not approved for implementation)
+
+The current module layout is suitable for the project's size. Preserve the separation between `Grader` (coordination), `SubmissionGrader` (job execution without the admin key or GitHub PAT), `GradingState` (persistent records, attempts and jobs; derived leaderboard), and `SlurmRunner` (scheduler details). The explicit reconciliation-pass order is a strength. `Grader` being about 350 lines does not itself justify splitting it.
+
+Ideas discussed:
+
+1. **Represent a pinned submission as one value.** A small `PinnedSubmission` dataclass containing `submission` and `commit_hash` could replace parallel submission lists and URL-keyed commit maps at the job interface. This would make repository/commit consistency easier to maintain and simplify job arguments.
+2. **Allow dependencies to be supplied for tests.** `Grader` currently constructs its runner, worker client and pusher internally. Supplying those dependencies, with normal production defaults, could reduce constructor/private-method patching in tests.
+3. **Make state-changing decisions explicit.** This is the user's preferred topic for the next discussion. In `_submit_assignment`, replace the `updated_submissions` comprehension with a regular loop: skip students in flight, call `_give_up_if_exhausted` explicitly (it can record an error and save state), then append eligible submissions. Preserve the current ordering and behavior.
+4. **Simplify aggregations eventually (low priority).** A name-to-function dictionary could replace the current abstract class and subclasses; `pretty_name` and `compatible_with` are unused.
+
+For item 3, also split `_snapshot` into creation and retry operations, with their effects visible directly in `_submit_assignment`:
+
+```python
+if assignment_cfg.name not in self.snapshots:
+    self._create_snapshot(assignment_cfg)
+else:
+    self._retry_unresolved_commits(assignment_cfg.name)
+
+submissions, commit_hashes = self.snapshots[assignment_cfg.name]
+```
+
+The helpers would contain the existing first-call and later-call logic. Successful commit hashes must remain fixed; only unresolved lookups are retried. Do not introduce an extra retry on the initial call. Leave `_pass` and `_ingest_results` structurally unchanged: their operation order and save-before-delete behavior are already explicit. These proposals are readability/refactoring work, not changes to grading policy. Discuss before implementing.
 
 ### Possible improvements (not planned)
 

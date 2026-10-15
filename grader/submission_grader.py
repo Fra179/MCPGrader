@@ -3,10 +3,11 @@ import logging
 import os
 import signal
 import subprocess
+import time
 from pathlib import Path
 from shutil import copyfile, rmtree
 
-from git import Repo
+from git import Repo, exc
 
 from config import AssignmentTaskConfig
 from grader_worker import SubmissionInfo
@@ -33,7 +34,7 @@ class SubmissionGrader:
         self.log_level = log_level
         self.log = logging.getLogger(f"grader.task.{task.name}")  # handlers are attached in the job
 
-    def grade_all(self, submissions: list[SubmissionInfo], results_dir: Path) -> None:
+    def grade_all(self, submissions: list[SubmissionInfo], results_dir: Path, commit_hashes: dict[str, str] | None = None) -> None:
         """Entry point of the SLURM job: grade each submission and write its result file."""
         # Each result is written to results_dir as soon as it's ready, so if the job dies
         # only the submission being graded at that moment is lost
@@ -46,7 +47,8 @@ class SubmissionGrader:
 
         for submission in submissions:
             try:
-                res = self.grade(submission)
+                commit_hash = commit_hashes[submission.ssh_url] if commit_hashes is not None else None
+                res = self.grade(submission, commit_hash)
                 write_json_atomic(results_dir / f"{res['name']}.json", res)
             except Exception as e:
                 self.log.error("Failed to grade submission %s[%s]: %s", submission.repo_url, self.task.name, str(e))
@@ -56,16 +58,22 @@ class SubmissionGrader:
                     rmtree(self.repo_dir(submission), ignore_errors=True)
 
     def repo_dir(self, submission: SubmissionInfo) -> Path:
+        # TODO (not urgent): use a more resistant dir name like submission UUID + task
+        # replacing '/' to '_' makes course_group/solution and course/group_solution (for example).
         return self.workdir / (self._repo_full_name(submission).replace('/', '_') + f"_{self.task.name}")
 
     def _repo_full_name(self, submission: SubmissionInfo) -> str:
         return submission.ssh_url.split(":", 1)[1].removesuffix(".git")
 
-    def grade(self, submission: SubmissionInfo) -> TaskGradeResult:
-        """Clone the submission and grade it."""
+    def grade(self, submission: SubmissionInfo, commit_hash: str | None = None) -> TaskGradeResult:
+        """Clone the submission and grade the requested snapshot commit (HEAD for legacy jobs)."""
         self.log.info("Grading submission for %s[%s]", self._repo_full_name(submission), self.task.name)
         repo_dir = self.repo_dir(submission)
+        commit_hash = self._clone_repo(submission, repo_dir, commit_hash)
+        return self._grade_cloned(submission, commit_hash, repo_dir)
 
+    def _clone_repo(self, submission: SubmissionInfo, repo_dir: Path, commit_hash: str | None) -> str:
+        """Replace the clone, check out the requested commit, and return its actual hash."""
         if repo_dir.exists():
             self.log.info("Cleaning up existing repository directory %s", repo_dir)
             rmtree(repo_dir)
@@ -73,17 +81,26 @@ class SubmissionGrader:
         self.log.debug("Downloading %s", submission.repo_url)
         with deploy_key_env(submission.deploy_key) as env:
             repo = Repo.clone_from(submission.ssh_url, repo_dir, env=env)
+            if commit_hash is not None:
+                # The snapshot may no longer be on a branch fetched by clone (e.g. a force-push).
+                try:
+                    repo.git.cat_file("-e", f"{commit_hash}^{{commit}}")
+                except exc.GitCommandError:
+                    with repo.git.custom_environment(**env):
+                        repo.git.fetch("origin", commit_hash)
+                repo.git.checkout("--detach", commit_hash)
 
         commit_hash = repo.head.commit.hexsha
         self.log.debug("Cloned repository at commit %s", commit_hash)
-
-        return self._grade_cloned(submission, commit_hash, repo_dir)
+        return commit_hash
 
     def _grade_cloned(self, submission: SubmissionInfo, commit_hash: str, repo_dir: Path) -> TaskGradeResult:
         task, log = self.task, self.log
 
         # Copy the grading script to the repo directory
         grading_script_dest = repo_dir / Path(task.test_script_path).name
+        # Remove a student-committed symlink without touching its target.
+        grading_script_dest.unlink(missing_ok=True)
         copyfile(task.test_script_path, grading_script_dest)
 
         # Make the grading script executable
@@ -156,12 +173,18 @@ class SubmissionGrader:
         # Kill the whole group, not just the script: make, srun and the student's binary would
         # otherwise keep running and hold the output pipes open. SIGTERM first lets srun clean up.
         for sig in (signal.SIGTERM, signal.SIGKILL):
+            deadline = time.monotonic() + KILL_GRACE_SECONDS
             try:
                 os.killpg(process.pid, sig)
             except ProcessLookupError:
                 pass
             try:
                 stdout, stderr = process.communicate(timeout=KILL_GRACE_SECONDS)
+                if sig == signal.SIGTERM:
+                    # Closed pipes and an exited leader don't mean every child exited.
+                    # Allow the rest of the group its grace period, then send SIGKILL.
+                    time.sleep(max(0, deadline - time.monotonic()))
+                    continue
                 return None, stdout, stderr
             except subprocess.TimeoutExpired:
                 continue

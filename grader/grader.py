@@ -19,6 +19,7 @@ UNKNOWN_JOB_GRACE = timedelta(minutes=10)
 # Jobs a submission gets, for the same commit and task configuration, before it's given an error
 # result instead of another job (each job that ends without its result counts)
 MAX_GRADING_ATTEMPTS = 3
+HEAD_LOOKUP_ATTEMPTS = 3
 
 class Grader:
     """Grades in passes. Each pass catches up with what happened since the last one: it drops finished
@@ -37,8 +38,7 @@ class Grader:
         self.grading_state: GradingState  # loaded once the lock is held
         self.poll_interval = 30.0
         
-        # submissions and their HEAD commits, fetched once per run: later passes of the same run only
-        # submit what this snapshot says
+        # Successful HEAD lookups stay fixed for the run; unresolved ones can be retried.
         self.snapshots: dict[str, tuple[list[SubmissionInfo], dict[str, str | None]]] = {}
 
     def grade(self):
@@ -97,11 +97,18 @@ class Grader:
             # 1. have a new commit or a changed task configuration
             # 2. are not already being graded by a job in flight
             # 3. have not already had MAX_GRADING_ATTEMPTS jobs that ended without producing their result
-            updated_submissions = [
-                submission for submission in self._filter_updated_submissions(assignment_cfg, task, submissions, commit_hashes)
-                if str(submission.student_id) not in in_flight
-                and not self._give_up_if_exhausted(assignment_cfg, task, submission, commit_hashes[submission.ssh_url])
-            ]
+            updated_submissions = []
+
+            for submission in self._filter_updated_submissions(assignment_cfg, task, submissions, commit_hashes):
+                if str(submission.student_id) in in_flight:
+                    continue
+
+                commit_hash = commit_hashes[submission.ssh_url]
+
+                if self._give_up_if_exhausted(assignment_cfg, task, submission, commit_hash):
+                    continue
+
+                updated_submissions.append(submission)
 
             if blocked_by is not None:
                 if updated_submissions:
@@ -141,8 +148,14 @@ class Grader:
         for batch in batches:
             if not self._has_free_job_slot():
                 break
+            batch_commits: dict[str, str] = {}
+            for submission in batch:
+                commit_hash = commit_hashes[submission.ssh_url]
+                if commit_hash is None:
+                    raise ValueError(f"Cannot submit {submission.repo_url} without a snapshot commit")
+                batch_commits[submission.ssh_url] = commit_hash
             try:
-                job_id = self.runner.submit(submission_grader.grade_all, task, batch, results_dir)
+                job_id = self.runner.submit(submission_grader.grade_all, task, batch, results_dir, batch_commits)
             except Exception as e:
                 # any reason for the failure that's dependent on slurm or the cluster will be tried again later
                 self.log.error("Failed to submit a grading job for %s[%s]: %s", assignment_cfg.name, task.name, str(e))
@@ -238,6 +251,16 @@ class Grader:
             submissions = worker.get_submissions(assignment_cfg.name)
             self.log.info("Found %d submissions for assignment %s", len(submissions), assignment_cfg.name)
             self.snapshots[assignment_cfg.name] = (submissions, self._get_latest_commit_hashes(submissions))
+        else:
+            submissions, commit_hashes = self.snapshots[assignment_cfg.name]
+            unresolved = [
+                submission for submission in submissions
+                if submission.ssh_url in commit_hashes and commit_hashes[submission.ssh_url] is None
+            ]
+            # retry only failed lookups to avoid a successful lookup from moving to a newer HEAD.
+            for submission in unresolved:
+                commit_hashes.pop(submission.ssh_url)
+            commit_hashes.update(self._get_latest_commit_hashes(unresolved))
         return self.snapshots[assignment_cfg.name]
 
     def _get_latest_commit_hash(self, submission: SubmissionInfo) -> str:
@@ -251,13 +274,17 @@ class Grader:
         commit_hashes: dict[str, str | None] = {}
 
         for submission in submissions:
-            try:
-                commit_hashes[submission.ssh_url] = self._get_latest_commit_hash(submission)
-            except exc.GitCommandError:
-                self.log.warning("Failed to get commit hash for submission %s, marking as updated", submission.repo_url)
-                commit_hashes[submission.ssh_url] = None
-            except IndexError:
-                self.log.info("Submission %s has no commits, skipping grading", submission.repo_url)
+            for attempt in range(HEAD_LOOKUP_ATTEMPTS):
+                try:
+                    commit_hashes[submission.ssh_url] = self._get_latest_commit_hash(submission)
+                    break
+                except exc.GitCommandError:
+                    if attempt + 1 == HEAD_LOOKUP_ATTEMPTS:
+                        self.log.warning("Failed to get commit hash for submission %s after %d attempts, skipping until a later pass or run", submission.repo_url, HEAD_LOOKUP_ATTEMPTS)
+                        commit_hashes[submission.ssh_url] = None
+                except IndexError:
+                    self.log.info("Submission %s has no commits, skipping grading", submission.repo_url)
+                    break
 
         return commit_hashes
 
@@ -269,7 +296,7 @@ class Grader:
                 continue
 
             commit_hash = commit_hashes[submission.ssh_url]
-            if commit_hash is None or self.grading_state.needs_grading(assignment_cfg.name, task, submission, commit_hash):
+            if commit_hash is not None and self.grading_state.needs_grading(assignment_cfg.name, task, submission, commit_hash):
                 updated_submissions.append(submission)
 
         return updated_submissions

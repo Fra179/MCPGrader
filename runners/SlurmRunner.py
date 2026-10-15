@@ -19,7 +19,8 @@ class SlurmRunner(ABRunner):
 
     def __init__(self, logs_folder: str = "./logs"):
         super().__init__()
-        self.executor = submitit.AutoExecutor(folder=logs_folder)
+        self.logs_folder = logs_folder
+        self.cluster = submitit.AutoExecutor(folder=logs_folder).cluster
         self.jobs: dict[str, Job] = {}  # submitted by this process
 
     def submit(self, grading_function: Callable[..., Any], task: AssignmentTaskConfig, *args, **kwargs) -> str:
@@ -30,16 +31,18 @@ class SlurmRunner(ABRunner):
 
         config["slurm_use_srun"] = False  # We are already running inside a SLURM job
 
+        # create a new executor as not to carry over previous configs
+        executor = submitit.AutoExecutor(folder=self.logs_folder, cluster=self.cluster)
         # task only supplies the SLURM parameters; the function gets just args/kwargs
-        self.executor.update_parameters(**config)
-        job = self.executor.submit(grading_function, *args, **kwargs)
+        executor.update_parameters(**config)
+        job = executor.submit(grading_function, *args, **kwargs)
         self.jobs[job.job_id] = job
         return job.job_id
 
     def finished_jobs(self, job_ids: list[str]) -> dict[str, str]:
         if not job_ids:
             return {}
-        if self.executor.cluster == "slurm":
+        if self.cluster == "slurm":
             return self._finished_slurm_jobs(job_ids)
         return self._finished_local_jobs(job_ids)
 

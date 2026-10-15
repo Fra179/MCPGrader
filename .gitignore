@@ -287,3 +287,4 @@ test_scripts/*
 *.lock
 keys/
 results/
+tests/

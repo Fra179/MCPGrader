@@ -103,7 +103,7 @@ class GraderConfig:
     working_dir: str
     grades_file: str
     worker_url: str # base URL of the grader Cloudflare Worker
-    worker_private_key: str # path to the ECDSA P-256 admin key (PEM) used to sign worker requests
+    worker_private_key: str # path to the ECDSA P-256 admin key used to sign worker requests
     sentry_dsn: Optional[str] = None
     max_submitted_jobs: int = -1 # at most this many grading jobs queued or running at once; -1 = no limit
     job_mode: str = "per_task" # "per_task": one job per task; "per_submission": one job per (student, task)
@@ -111,6 +111,7 @@ class GraderConfig:
 
     def assert_valid(self) -> None:
         assert isinstance(self.working_dir, str) and self.working_dir, "working_dir must be a non-empty string"
+        assert path.isabs(self.working_dir), "working_dir must be an absolute path"
         assert path.exists(self.working_dir), f"working_dir {self.working_dir} does not exist"
         assert isinstance(self.grades_file, str) and self.grades_file, "grades_file must be a non-empty string"
         assert isinstance(self.worker_url, str) and self.worker_url.startswith(("https://", "http://")), "worker_url must be an http(s) URL"

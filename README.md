@@ -69,7 +69,7 @@ Edit the `grader` section in `grader-config.yaml`:
 
 ```yaml
 grader:
-  working_dir: "/tmp/grader"
+  working_dir: "/tmp/grader" # must be an absolute path and already exist
   grades_file: "leaderboard.json"
   worker_url: "https://grader-api.example.com"
   worker_private_key: "keys/grader.key"
@@ -81,7 +81,7 @@ grader:
 
 **Field Explanations:**
 
-- **`working_dir`**: Directory where student repositories will be cloned. This directory must exist before running the grader.
+- **`working_dir`**: Absolute path to the directory where student repositories will be cloned. This directory must exist before running the grader; relative paths such as `./work` are rejected.
 - **`grades_file`**: Path to the output JSON file containing all grading results and the leaderboard. It's rewritten on every run from `<working_dir>/grading_state.json`, where the grader keeps every student's latest result together with the commit and task configuration it was graded with. Don't edit the grades file by hand: changes are overwritten. Deleting `grading_state.json` makes the next run regrade everyone.
 - **`worker_url`** (required): Base URL of the grader worker.
 - **`worker_private_key`** (required): Path to the ECDSA P-256 admin private key (PEM) used to sign requests to the worker. This file must exist before running the grader. See [Admin Key](#admin-key).
@@ -267,7 +267,9 @@ The grader works in passes (see `wait_for_jobs`). In each pass it will:
 
 When the run ends, it writes the leaderboard to the `grades_file` and pushes it (the push is skipped if the leaderboard didn't change).
 
-Submissions and their latest commits are read once per run; commits pushed later are picked up by the next run. The jobs in flight are kept in `grading_state.json`, so a run killed at any point loses nothing: the next one waits for those jobs and records their results instead of grading the same students again.
+Submissions and their latest commits are snapshotted once per run. Jobs explicitly check out the snapshotted commit, so every task grades that commit even if the student pushes before the job starts; later commits are picked up by the next run. Failed HEAD lookups are retried up to three times before submission. Submissions whose HEAD still cannot be resolved are skipped until a later pass or run; successful lookups stay fixed for the run. If a snapshotted commit is absent from the clone, the job tries to fetch it explicitly. If that fails, grading fails rather than using another commit, subject to the usual grading-attempt cap.
+
+The jobs in flight are kept in `grading_state.json`, so a run killed at any point loses nothing: the next one waits for those jobs and records their results instead of grading the same students again.
 
 Only one run at a time works on a `working_dir`: a run holds a lock on `<working_dir>/grader.lock` until it ends, and a run started meanwhile logs who holds it and exits, so a schedule can start the grader as often as it likes. The lock is released when the run ends or dies, even with `kill -9` or at a SLURM time limit. At startup, `main.py` checks that locking works in `working_dir` and, on Lustre or NFS, that locks are shared across nodes; it refuses to run otherwise.
 

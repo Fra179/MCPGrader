@@ -1,5 +1,5 @@
 grader:
-  working_dir: "/tmp/grader"
+  working_dir: "/tmp/grader" # must be an absolute path and already exist
   grades_file: "leaderboard.json"
   worker_url: "https://grader-api.example.com"
   worker_private_key: "keys/grader.key" # admin key authorized in the worker's ADMIN_PUBLIC_KEYS
