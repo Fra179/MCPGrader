@@ -287,4 +287,5 @@ test_scripts/*
 *.lock
 keys/
 results/
+usage-compute/
 tests/

@@ -1,17 +1,20 @@
 import json
 import time
+from dataclasses import replace
 from datetime import datetime, timedelta, timezone
 from typing import Iterable
 from config import ProgramConfig, AssignmentConfig, AssignmentTaskConfig
 from git import Git, exc
 from pathlib import Path
 from logging import Logger
+import sentry_sdk
 from runners import *
 from .structs import TaskGradeResult
 from pusher.github_pusher import GithubPusher
 from grader_worker import GraderWorkerAPI, SubmissionInfo
 from .grading_state import GradingState, JobRecord
 from .submission_grader import SubmissionGrader
+from .repository_staging import RepositoryStaging
 from .utils import LockHeldError, deploy_key_env, exclusive_lock, write_json_atomic
 
 # How long a job the scheduler doesn't know about yet (sacct can lag right after sbatch) still counts as in flight
@@ -40,6 +43,9 @@ class Grader:
         
         # Successful HEAD lookups stay fixed for the run; unresolved ones can be retried.
         self.snapshots: dict[str, tuple[list[SubmissionInfo], dict[str, str | None]]] = {}
+        self.repository_staging = RepositoryStaging(self.wd)
+        self.failed_downloads: set[tuple[str, str]] = set()
+        self.reported_download_failures: set[tuple[str, str, str]] = set()
 
     def grade(self):
         """One pass, or with wait_for_jobs, passes until no job is in flight and nothing is left to submit."""
@@ -73,6 +79,7 @@ class Grader:
         for assignment in self.config.assignments:
             deferred += self._submit_assignment(assignment)
 
+        self.repository_staging.cleanup({bundle for job in self.grading_state.jobs for bundle in job.get("bundles", [])})
         return bool(self.grading_state.jobs) or deferred > 0
 
     def _submit_assignment(self, assignment_cfg: AssignmentConfig) -> int:
@@ -130,7 +137,8 @@ class Grader:
 
     def _submit_task(self, assignment_cfg: AssignmentConfig, task: AssignmentTaskConfig, updated_submissions: list[SubmissionInfo], commit_hashes: dict[str, str | None]) -> tuple[int, int]:
         """Submit this task's updated submissions, up to max_submitted_jobs in flight. Returns how many
-        jobs were deferred by that limit and how many failed to submit; both are left to later passes."""
+        jobs were deferred by that limit and how many downloads/submissions failed.
+        Download failures wait for the next run; refused jobs can retry on later passes."""
         if self.config.grader.job_mode == "per_submission":
             batches = [[submission] for submission in updated_submissions]
         else:
@@ -140,37 +148,68 @@ class Grader:
         results_dir = self._results_dir(assignment_cfg, task)
         results_dir.mkdir(parents=True, exist_ok=True)
 
-        # TODO: submitit pickles the arguments (including every student's deploy_key) into
-        # <working_dir>/slurm_logs/*_submitted.pkl and never deletes them, deal with it
+        # Only credential-free submission copies and local bundle paths go into job pickles.
         submission_grader = SubmissionGrader(task, self.wd, assignment_cfg.preserve_repo_files, self.log.level)
 
-        submitted = failed = 0
+        submitted = failed = processed = 0
         for batch in batches:
             if not self._has_free_job_slot():
                 break
+            processed += 1
             batch_commits: dict[str, str] = {}
+            bundle_paths: dict[str, str] = {}
+            ready = []
             for submission in batch:
                 commit_hash = commit_hashes[submission.ssh_url]
                 if commit_hash is None:
                     raise ValueError(f"Cannot submit {submission.repo_url} without a snapshot commit")
+                download = (submission.ssh_url, commit_hash)
+                if download in self.failed_downloads:
+                    failed += 1
+                    continue
+                try:
+                    bundle = self.repository_staging.stage(submission, commit_hash)
+                except Exception as e:
+                    self.failed_downloads.add(download)
+                    self._report_download_failure(submission, "bundle", e)
+                    failed += 1
+                    continue
                 batch_commits[submission.ssh_url] = commit_hash
+                bundle_paths[submission.ssh_url] = str(bundle)
+                ready.append(replace(submission, deploy_key=""))
+            if not ready:
+                continue
             try:
-                job_id = self.runner.submit(submission_grader.grade_all, task, batch, results_dir, batch_commits)
+                job_id = self.runner.submit(submission_grader.grade_all, task, ready, results_dir, batch_commits, bundle_paths)
             except Exception as e:
                 # any reason for the failure that's dependent on slurm or the cluster will be tried again later
                 self.log.error("Failed to submit a grading job for %s[%s]: %s", assignment_cfg.name, task.name, str(e))
                 failed += 1
                 continue
-            students = [str(submission.student_id) for submission in batch]
-            self.grading_state.add_job(job_id, assignment_cfg.name, task.name, students, submission_grader.perf_hash)
-            for submission in batch:
+            students = [str(submission.student_id) for submission in ready]
+            self.grading_state.add_job(job_id, assignment_cfg.name, task.name, students, submission_grader.perf_hash, list(bundle_paths.values()))
+            for submission in ready:
                 self.grading_state.add_attempt(assignment_cfg.name, str(submission.student_id), task.name, commit_hashes[submission.ssh_url], submission_grader.perf_hash)
             self.grading_state.save()  # right away: a run killed now must still know this job exists
             submitted += 1
 
-        deferred = len(batches) - submitted - failed
+        deferred = len(batches) - processed
         self.log.info("Submitted %d grading job(s) for task %s[%s] with %d updated submissions%s", submitted, assignment_cfg.name, task.name, len(updated_submissions), f", {deferred} deferred by max_submitted_jobs" if deferred else "")
         return deferred, failed
+
+    def _report_download_failure(self, submission: SubmissionInfo, stage: str, error: Exception) -> None:
+        """One Sentry event per submission/stage per run, with no exception locals or deploy keys."""
+        self.log.warning("Repository %s failed for %s (student %s), skipping for now: %s", stage, submission.repo_url, submission.student_id, str(error))
+        identity = (submission.assignment_name, submission.id, stage)
+        if identity in self.reported_download_failures:
+            return
+        self.reported_download_failures.add(identity)
+        with sentry_sdk.new_scope() as scope:
+            scope.set_tag("assignment", submission.assignment_name)
+            scope.set_tag("student_id", str(submission.student_id))
+            scope.set_tag("download_stage", stage)
+            scope.set_context("repository", {"url": submission.repo_url, "submission_id": submission.id, "error": str(error)})
+            sentry_sdk.capture_message("Grader repository download failed", level="error")
 
     def _give_up_if_exhausted(self, assignment_cfg: AssignmentConfig, task: AssignmentTaskConfig, submission: SubmissionInfo, commit_hash: str | None) -> bool:
         """If this submission already had MAX_GRADING_ATTEMPTS jobs that ended without its result, record
@@ -278,10 +317,11 @@ class Grader:
                 try:
                     commit_hashes[submission.ssh_url] = self._get_latest_commit_hash(submission)
                     break
-                except exc.GitCommandError:
+                except exc.GitCommandError as e:
                     if attempt + 1 == HEAD_LOOKUP_ATTEMPTS:
                         self.log.warning("Failed to get commit hash for submission %s after %d attempts, skipping until a later pass or run", submission.repo_url, HEAD_LOOKUP_ATTEMPTS)
                         commit_hashes[submission.ssh_url] = None
+                        self._report_download_failure(submission, "HEAD lookup", e)
                 except IndexError:
                     self.log.info("Submission %s has no commits, skipping grading", submission.repo_url)
                     break

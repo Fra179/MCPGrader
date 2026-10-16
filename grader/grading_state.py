@@ -1,7 +1,7 @@
 import json
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Any, TypedDict
+from typing import Any, NotRequired, TypedDict
 
 from aggregation import AGG_NAME_TO_CLASS
 from config import ProgramConfig, AssignmentTaskConfig
@@ -38,6 +38,7 @@ class JobRecord(TypedDict):
     students: list[StudentId]  # whose submissions it grades
     perf_hash: str
     submitted_at: str  # ISO 8601, UTC
+    bundles: NotRequired[list[str]]  # local sources; absent on legacy jobs
 
 class AttemptRecord(TypedDict):
     """How many jobs were submitted for a submission without producing its result."""
@@ -121,7 +122,7 @@ class GradingState:
             "count": count,
         }
 
-    def add_job(self, job_id: str, assignment_name: AssignmentName, task_name: TaskName, students: list[StudentId], perf_hash: str) -> None:
+    def add_job(self, job_id: str, assignment_name: AssignmentName, task_name: TaskName, students: list[StudentId], perf_hash: str, bundles: list[str] | None = None) -> None:
         self.jobs.append({
             "job_id": job_id,
             "assignment": assignment_name,
@@ -129,6 +130,7 @@ class GradingState:
             "students": students,
             "perf_hash": perf_hash,
             "submitted_at": datetime.now(timezone.utc).isoformat(),
+            "bundles": bundles or [],
         })
 
     def remove_job(self, job_id: str) -> None:

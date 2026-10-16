@@ -34,7 +34,7 @@ class SubmissionGrader:
         self.log_level = log_level
         self.log = logging.getLogger(f"grader.task.{task.name}")  # handlers are attached in the job
 
-    def grade_all(self, submissions: list[SubmissionInfo], results_dir: Path, commit_hashes: dict[str, str] | None = None) -> None:
+    def grade_all(self, submissions: list[SubmissionInfo], results_dir: Path, commit_hashes: dict[str, str] | None = None, bundle_paths: dict[str, str] | None = None) -> None:
         """Entry point of the SLURM job: grade each submission and write its result file."""
         # Each result is written to results_dir as soon as it's ready, so if the job dies
         # only the submission being graded at that moment is lost
@@ -48,7 +48,8 @@ class SubmissionGrader:
         for submission in submissions:
             try:
                 commit_hash = commit_hashes[submission.ssh_url] if commit_hashes is not None else None
-                res = self.grade(submission, commit_hash)
+                bundle = Path(bundle_paths[submission.ssh_url]) if bundle_paths is not None else None
+                res = self.grade(submission, commit_hash, bundle)
                 write_json_atomic(results_dir / f"{res['name']}.json", res)
             except Exception as e:
                 self.log.error("Failed to grade submission %s[%s]: %s", submission.repo_url, self.task.name, str(e))
@@ -65,19 +66,28 @@ class SubmissionGrader:
     def _repo_full_name(self, submission: SubmissionInfo) -> str:
         return submission.ssh_url.split(":", 1)[1].removesuffix(".git")
 
-    def grade(self, submission: SubmissionInfo, commit_hash: str | None = None) -> TaskGradeResult:
+    def grade(self, submission: SubmissionInfo, commit_hash: str | None = None, bundle: Path | None = None) -> TaskGradeResult:
         """Clone the submission and grade the requested snapshot commit (HEAD for legacy jobs)."""
         self.log.info("Grading submission for %s[%s]", self._repo_full_name(submission), self.task.name)
         repo_dir = self.repo_dir(submission)
-        commit_hash = self._clone_repo(submission, repo_dir, commit_hash)
+        commit_hash = self._clone_repo(submission, repo_dir, commit_hash, bundle)
         return self._grade_cloned(submission, commit_hash, repo_dir)
 
-    def _clone_repo(self, submission: SubmissionInfo, repo_dir: Path, commit_hash: str | None) -> str:
+    def _clone_repo(self, submission: SubmissionInfo, repo_dir: Path, commit_hash: str | None, bundle: Path | None = None) -> str:
         """Replace the clone, check out the requested commit, and return its actual hash."""
         if repo_dir.exists():
             self.log.info("Cleaning up existing repository directory %s", repo_dir)
             rmtree(repo_dir)
 
+        if bundle is not None:
+            if commit_hash is None:
+                raise ValueError("A staged repository requires a pinned commit")
+            # No network access or deploy key in new jobs. Missing bundles fail locally.
+            with Repo.clone_from(str(bundle), repo_dir) as repo:
+                repo.git.checkout("--detach", commit_hash)
+                return repo.head.commit.hexsha
+
+        # Compatibility with already-pickled jobs and direct callers predating staging.
         self.log.debug("Downloading %s", submission.repo_url)
         with deploy_key_env(submission.deploy_key) as env:
             repo = Repo.clone_from(submission.ssh_url, repo_dir, env=env)

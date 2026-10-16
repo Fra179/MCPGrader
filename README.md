@@ -85,7 +85,7 @@ grader:
 - **`grades_file`**: Path to the output JSON file containing all grading results and the leaderboard. It's rewritten on every run from `<working_dir>/grading_state.json`, where the grader keeps every student's latest result together with the commit and task configuration it was graded with. Don't edit the grades file by hand: changes are overwritten. Deleting `grading_state.json` makes the next run regrade everyone.
 - **`worker_url`** (required): Base URL of the grader worker.
 - **`worker_private_key`** (required): Path to the ECDSA P-256 admin private key (PEM) used to sign requests to the worker. This file must exist before running the grader. See [Admin Key](#admin-key).
-- **`sentry_dsn`**: (Optional) Sentry DSN for error tracking and monitoring. Leave empty if not using Sentry.
+- **`sentry_dsn`**: (Optional) Sentry DSN for error tracking and monitoring. Failed HEAD lookups (after three attempts) and repository downloads generate an explicit error event, once per submission and download stage per run, with assignment, student ID, repository URL and error details. Deploy keys and exception locals are not attached. Leave empty if not using Sentry.
 - **`max_submitted_jobs`** (default: `-1`, no limit): At most this many grading jobs are queued or running on the cluster at once, across all tasks and assignments. Extra jobs are submitted by later passes as earlier ones finish (by the next run, with `wait_for_jobs: false`), so the cluster's per-user job limit isn't hit. Jobs from earlier runs that are still in flight count too. It only counts the grader's own jobs: if the same user submits other jobs, leave some margin. A job the cluster still refuses is logged, and its students are retried on the next run.
 - **`job_mode`** (default: `"per_task"`): `"per_task"` grades all of a task's updated submissions one after another in a single job; `"per_submission"` launches one job per (student, task) for maximum parallelism. With `"per_submission"`, a task's `timeout_min` must cover a single student instead of all of them, and you'll usually want `max_submitted_jobs` set.
 - **`wait_for_jobs`** (default: `true`): The grader works in passes: each pass records the results written so far, forgets jobs that have finished, and submits jobs for submissions that need grading. With `true`, a run repeats passes every 30 seconds until no job is in flight and nothing is left to submit. With `false`, a run makes a single pass and exits without waiting for its jobs: the next run records their results. Either way, the leaderboard is written (and pushed) once, when the run ends. Use `false` when the grader is started on a schedule, e.g. every 10 minutes.
@@ -259,7 +259,10 @@ The grader works in passes (see `wait_for_jobs`). In each pass it will:
 2. For each assignment (unless skipped), submit grading jobs, up to `max_submitted_jobs` in flight:
    - Read student submissions for the assignment from the grader worker
    - Skip repositories whose latest commit was already graded with the task's current configuration, or that a job in flight is grading
-   - Clone each student's repository with their deploy key
+   - Download each required pinned repository in the coordinator using its deploy key, and atomically create a Git bundle in `<working_dir>/repository_bundles/`
+   - Submit jobs with local bundle paths and copies of the submissions with their deploy keys removed
+3. Inside each grading job (no internet access required):
+   - Clone the local bundle and explicitly check out the pinned commit
    - Copy the test script to the repository
    - Execute the test script
    - Parse the output for test results and performance metrics
@@ -267,13 +270,53 @@ The grader works in passes (see `wait_for_jobs`). In each pass it will:
 
 When the run ends, it writes the leaderboard to the `grades_file` and pushes it (the push is skipped if the leaderboard didn't change).
 
-Submissions and their latest commits are snapshotted once per run. Jobs explicitly check out the snapshotted commit, so every task grades that commit even if the student pushes before the job starts; later commits are picked up by the next run. Failed HEAD lookups are retried up to three times before submission. Submissions whose HEAD still cannot be resolved are skipped until a later pass or run; successful lookups stay fixed for the run. If a snapshotted commit is absent from the clone, the job tries to fetch it explicitly. If that fails, grading fails rather than using another commit, subject to the usual grading-attempt cap.
+Submissions and their latest commits are snapshotted once per run. Jobs explicitly check out the snapshotted commit, so every task grades that commit even if the student pushes before the job starts; later commits are picked up by the next run. Failed HEAD lookups are retried up to three times before submission. Submissions whose HEAD still cannot be resolved are skipped until a later pass or run; successful lookups stay fixed for the run. If the pinned commit is missing from the coordinator's download, the coordinator tries to fetch it explicitly before creating the bundle. Download/fetch failures are logged and reported to Sentry when configured; the affected repository/commit is skipped for the rest of the run and retried on the next run. These failures submit no grading jobs, consume no grading attempts, and leave existing grades unchanged. Other submissions can still be graded; a failed download for a blocking task holds back later tasks in that assignment.
+
+Bundles are identified by repository URL and commit, shared across tasks, and retained while any job in `grading_state.json` references them. Each pass removes unreferenced bundles after submitting new work, so queued jobs survive coordinator restarts. The coordinator and jobs must see `working_dir` at the same absolute path. Jobs submitted before this change keep their legacy remote-cloning behavior, and their old submitit pickles still contain deploy keys.
+
+On Leonardo, run the coordinator on `lrd_all_serial` (GitHub HTTPS and SSH were verified there); DCGP and Booster jobs use the shared bundles. The worker endpoint and scheduler commands must also be reachable from the coordinator. Git bundles contain committed Git files and history; Git LFS objects and submodule repositories are not downloaded automatically.
 
 The jobs in flight are kept in `grading_state.json`, so a run killed at any point loses nothing: the next one waits for those jobs and records their results instead of grading the same students again.
 
 Only one run at a time works on a `working_dir`: a run holds a lock on `<working_dir>/grader.lock` until it ends, and a run started meanwhile logs who holds it and exits, so a schedule can start the grader as often as it likes. The lock is released when the run ends or dies, even with `kill -9` or at a SLURM time limit. At startup, `main.py` checks that locking works in `working_dir` and, on Lustre or NFS, that locks are shared across nodes; it refuses to run otherwise.
 
 A submission whose grading jobs end 3 times without producing its result (the job crashed, was killed or hit `timeout_min`, or the repository couldn't be cloned) gets an `error` result instead of another job. A new commit or a change to the task tries again.
+
+### Recovering from earlier compute-node download failures
+
+The staging change does not invalidate existing grades. If a previous run exhausted its attempt cap because compute nodes could not download repositories, reset only those affected error records after deploying the change. From the grader directory, edit the assignment, task and student IDs below for your case. The command holds the grader lock, refuses to reset a task with jobs in flight, and backs up the state before changing it. The next grader run regrades the selected submissions; the derived leaderboard is refreshed when that run publishes.
+
+```bash
+uv run python - <<'PY'
+from datetime import datetime, timezone
+from pathlib import Path
+from shutil import copyfile
+from config import ConfigParser
+from grader.grading_state import GradingState
+from grader.utils import exclusive_lock
+
+assignment, task = "mpi-matmul", "test-cpu"
+students = ["2175401", "2012601", "2049617"]
+parser = ConfigParser("grader-config.yaml")
+parser.parse()
+work = Path(parser.config.grader.working_dir)
+with exclusive_lock(work / "grader.lock"):
+    state = GradingState(work / "grading_state.json")
+    if state.task_jobs(assignment, task):
+        raise SystemExit("Task still has tracked jobs; let the grader reconcile them first")
+    backup = state.path.with_name("grading_state.backup-" + datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%S%f") + ".json")
+    copyfile(state.path, backup)
+    for student in students:
+        tasks = state.records.get(assignment, {}).get(student, {})
+        record = tasks.get(task)
+        if record and record["status"] == "error" and record["error"].startswith("Grading failed 3 times without producing a result"):
+            del tasks[task]
+            state.attempts.get(assignment, {}).get(student, {}).pop(task, None)
+            print("Reset", assignment, task, student)
+    state.save()
+    print("Backup:", backup)
+PY
+```
 
 ## Setting Up as a Recurrent Task
 
