@@ -24,6 +24,7 @@ assignments:
         skip: true
         blocking: true
         test_script_path: "./test_scripts/test_vectorsum_cpu.sh"
+        # setup_script: "./test_scripts/setup_mpi.sh" # optional Bash script sourced before grading
 
         slurm_backend:
           config:

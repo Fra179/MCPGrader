@@ -38,12 +38,16 @@ class AssignmentTaskConfig:
     blocking: bool = False
     reduction: Optional[str] = None
     submission_timeout: Optional[int] = None # seconds; the test script is killed after this long
+    setup_script: Optional[str] = None # trusted Bash script sourced before each grading script
     __performance_hash: Optional[str] = None # type: ignore
 
     def assert_valid(self) -> None:
         assert isinstance(self.name, str) and self.name, "name must be a non-empty string"
         assert self.test_script_path, "test_script_path must be provided"
         assert os.path.exists(self.test_script_path), f"test_script_path {self.test_script_path} does not exist"
+        if self.setup_script is not None:
+            assert isinstance(self.setup_script, str) and self.setup_script, "setup_script must be a non-empty string or None"
+            assert os.path.isfile(self.setup_script), f"setup_script {self.setup_script} must be an existing file"
         self.slurm_backend.assert_valid()
         assert isinstance(self.skip, bool), "skip must be a boolean"
         assert isinstance(self.blocking, bool), "blocking must be a boolean"
@@ -75,6 +79,11 @@ class AssignmentTaskConfig:
         hasher.update((self.reduction or "").encode('utf-8'))
         # A different timeout can change the results
         hasher.update(str(self.submission_timeout).encode('utf-8'))
+        if self.setup_script is not None:
+            hasher.update(b"\0setup_script\0")
+            hasher.update(self.setup_script.encode('utf-8'))
+            with open(self.setup_script, 'rb') as f:
+                hasher.update(f.read())
         self.__performance_hash = hasher.hexdigest()
         return self.__performance_hash
 

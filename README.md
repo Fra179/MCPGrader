@@ -177,6 +177,7 @@ assignments:
 - **`blocking`** (default: `false`): If `true`, the assignment's later tasks aren't submitted while this task still has jobs in flight or jobs waiting for `max_submitted_jobs` (or jobs the cluster refused); a later pass or run submits them once those are done. Useful when tasks shouldn't compete for the cluster or when later tasks depend on earlier ones.
 
 - **`test_script_path`** (required): Absolute or relative path to the test script that will be executed in each student's repository for this task.
+- **`setup_script`** (default: unset): Path to a trusted Bash script sourced before each submission's grading script. Relative paths are resolved from the coordinator's working directory; the original file must be accessible at that absolute path on compute nodes. It does not need executable permissions and is not copied into the student's repository. With setup enabled, a Bash login shell initializes the module environment, sources the setup with `errexit` enabled, then executes the grading script in the same shell, preserving exported variables and supporting Python grading scripts. Setup runs in the clone directory. A failing setup stops grading and produces an error result; `submission_timeout` covers setup and grading together. Adding/removing setup, changing its path, or editing its contents triggers regrading on the next run. Tasks without setup keep their existing launch behavior.
 
 - **`submission_timeout`** (default: no limit): Seconds a single student's test script may run. On timeout the script's whole process group (including `make`, `srun` and the student's program) gets SIGTERM, then SIGKILL 5 s later, and the result is recorded with status `timeout`. With `job_mode: "per_task"` all of a task's submissions are graded one after another in a single SLURM job, so `timeout_min` should cover the number of updated submissions times this value; with `"per_submission"` it only needs to cover one.
 
@@ -184,6 +185,21 @@ assignments:
 
 >### [!] Important [!]
 >When writing your test script don't forget to launch the student's script with either `srun`, `mpirun` or a similar command that will also schedule the process on the cluster!
+
+For example, to load MPI on Leonardo, create `test_scripts/setup_mpi.sh`:
+
+```bash
+module load gcc/12.2.0 || return 2
+module load openmpi/4.1.6--gcc--12.2.0-cuda-12.2 || return 2
+```
+
+Then add this to each MPI task alongside `test_script_path`:
+
+```yaml
+setup_script: "./test_scripts/setup_mpi.sh"
+```
+
+Explicitly export ordinary variables you want the grading script to inherit (for example, `export OMP_NUM_THREADS=4`). The grader's existing exit-code policy also applies to setup errors: they are cached until the commit or task configuration changes.
 
 ### Step 5: Configure SLURM Backend for Tasks
 

@@ -29,6 +29,8 @@ class SubmissionGrader:
         # Computed here, in the main process: the result must carry the configuration the job was
         # submitted with, even if the test script changes before the result is recorded
         self.perf_hash = task.performance_hash()
+        # Resolve relative config paths in the coordinator, before jobs change directory.
+        self.setup_script = Path(task.setup_script).resolve() if task.setup_script else None
         self.workdir = workdir
         self.preserve_repo_files = preserve_repo_files
         self.log_level = log_level
@@ -173,7 +175,12 @@ class SubmissionGrader:
 
     def _run_test_script(self, script: Path, cwd: Path) -> tuple[int | None, str, str]:
         """Run the test script in its own process group. Returns (returncode, stdout, stderr); returncode is None on timeout."""
-        process = subprocess.Popen([script], cwd=cwd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, start_new_session=True)
+        command = [script]
+        if setup_script := getattr(self, "setup_script", None):
+            # A login shell initializes the cluster's module command. Source and exec in the
+            # same shell so Python scripts inherit exports; positional args avoid shell injection.
+            command = ["bash", "-l", "-c", 'set -e\nsource "$1"\nexec "$2"', "grader-setup", str(setup_script), str(script)]
+        process = subprocess.Popen(command, cwd=cwd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, start_new_session=True)
         try:
             stdout, stderr = process.communicate(timeout=self.task.submission_timeout)
             return process.returncode, stdout, stderr
