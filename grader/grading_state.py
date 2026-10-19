@@ -2,6 +2,7 @@ import json
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, NotRequired, TypedDict
+from urllib.parse import urlsplit
 
 from aggregation import AGG_NAME_TO_CLASS
 from config import ProgramConfig, AssignmentTaskConfig
@@ -15,6 +16,19 @@ STATE_VERSION = 1
 type AssignmentName = str
 type StudentId = str  # the worker's student_id, as a string (JSON object keys)
 type TaskName = str
+
+def _leaderboard_name(repo_url: str, student_id: str) -> str:
+    """Use the GitHub repository owner, falling back to the internal student ID."""
+    if repo_url.startswith("git@github.com:"):
+        repo_url = "https://github.com/" + repo_url.removeprefix("git@github.com:")
+    try:
+        parsed = urlsplit(repo_url)
+    except ValueError:
+        return student_id
+    parts = parsed.path.strip("/").split("/")
+    if parsed.hostname == "github.com" and len(parts) == 2 and all(parts):
+        return parts[0]
+    return student_id
 
 class TaskRecord(TypedDict):
     """One student's latest result for one task, and what it was graded with."""
@@ -147,6 +161,7 @@ class GradingState:
 
         Each task's reduction is looked up in the current config (mean if unset, or if the task
         is no longer configured) and turns the reported times into avg_runtime.
+        Names use the GitHub owner of the most recently graded repository; state keys stay student IDs.
         """
         # TODO: drop students no longer in the worker and tasks no longer in the config.
         reductions = {
@@ -159,8 +174,9 @@ class GradingState:
             entries = []
             for student_id, tasks in students.items():
                 reduction = {task: reductions.get((assignment_name, task), "mean") for task in tasks}
+                latest = max(tasks.values(), key=lambda record: record["graded_at"], default=None)
                 entries.append({
-                    "name": student_id,
+                    "name": _leaderboard_name(latest["repo_url"], student_id) if latest else student_id,
                     "commit_hash": {task: r["commit_hash"] for task, r in tasks.items()},
                     "tasks": list(tasks),
                     "status": {task: r["status"] for task, r in tasks.items()},

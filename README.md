@@ -456,7 +456,7 @@ The grader produces a JSON file (specified in `grades_file`) with the following 
 {
   "assignment-name": [
     {
-      "name": "123456",
+      "name": "student-github-handle",
       "commit_hash": "abc1234",
       "status": "graded",
       "error": "",
@@ -474,7 +474,7 @@ The grader produces a JSON file (specified in `grades_file`) with the following 
 
 **Field Descriptions:**
 
-- **`name`**: The student ID from the worker submission
+- **`name`**: GitHub repository owner's username (or organization handle), from the most recently graded repository. Falls back to the student ID for non-GitHub URLs. Internal grading state remains keyed by student ID; existing grades receive the new display name on the next export without regrading.
 - **`commit_hash`**: Git commit hash (first 7 characters) of the graded submission
 - **`status`**: Grading status (`"graded"` or `"error"`)
 - **`error`**: Error message if status is `"error"`, empty otherwise
