@@ -12,3 +12,4 @@ class SubmissionInfo:
     deploy_key: str = field(repr=False)
     last_push: str | None = None  # when the worker received the latest push to the default branch
     last_commit: str | None = None  # commit SHA of that push, forgeable by the student: only a hint
+    update_id: int | None = None  # pending push version, never a grading execution identity

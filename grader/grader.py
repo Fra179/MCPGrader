@@ -13,6 +13,7 @@ from .structs import TaskGradeResult
 from pusher.github_pusher import GithubPusher
 from grader_worker import GraderWorkerAPI, SubmissionInfo
 from .grading_state import GradingState, JobRecord
+from .durable_jobs import DurableJobs
 from .submission_grader import SubmissionGrader
 from .repository_staging import RepositoryStaging
 from .utils import LockHeldError, deploy_key_env, exclusive_lock, write_json_atomic
@@ -46,6 +47,8 @@ class Grader:
         self.repository_staging = RepositoryStaging(self.wd)
         self.failed_downloads: set[tuple[str, str]] = set()
         self.reported_download_failures: set[tuple[str, str, str]] = set()
+        self._worker_client = None
+        self._discovery_updates = {}
 
     def grade(self):
         """One pass, or with wait_for_jobs, passes until no job is in flight and nothing is left to submit."""
@@ -70,22 +73,32 @@ class Grader:
 
     def _pass(self) -> bool:
         """Returns whether work remains: jobs in flight, or jobs not submitted because of max_submitted_jobs."""
+        self._publication_attempts = set()
+        DurableJobs(self).reconcile()
         self._drop_finished_jobs()
 
         # injest every result present in the folders
         self._ingest_results()
+        self._flush_publications()
 
         deferred = 0 # due to max_submitted_jobs these are jobs that are not yet submitted, shouldn't happen on CINECA but could happen on DI cluster
         for assignment in self.config.assignments:
             deferred += self._submit_assignment(assignment)
 
-        self.repository_staging.cleanup({bundle for job in self.grading_state.jobs for bundle in job.get("bundles", [])})
-        return bool(self.grading_state.jobs) or deferred > 0
+        retained = {bundle for job in self.grading_state.jobs for bundle in job.get("bundles", [])}
+        retained.update(DurableJobs(self).retained_bundles())
+        self.repository_staging.cleanup(retained)
+        self._flush_publications()
+        self._finish_snapshots()
+        self._flush_publications()
+        return bool(DurableJobs(self).occupied()) or deferred > 0
 
     def _submit_assignment(self, assignment_cfg: AssignmentConfig) -> int:
         """Submit jobs for this assignment's updated submissions; returns how many were deferred by max_submitted_jobs."""
         if all(task.skip for task in assignment_cfg.tasks):
             self.log.info("Skipping assignment %s: all its tasks are skipped", assignment_cfg.name)
+            if self.config.grader.worker_publication:
+                self._snapshot(assignment_cfg)
             return 0
 
         submissions, commit_hashes = self._snapshot(assignment_cfg)
@@ -99,6 +112,7 @@ class Grader:
 
             # jobs for this task of this assignment that are already running
             in_flight = {student for job in self.grading_state.task_jobs(assignment_cfg.name, task.name) for student in job["students"]}
+            in_flight.update(DurableJobs(self).held_students(assignment_cfg.name, task.name))
             
             # submissions that should be sent out in this pass are the submissions of those students that:
             # 1. have a new commit or a changed task configuration
@@ -130,7 +144,7 @@ class Grader:
                 self.log.info("No updated submissions for task %s[%s]%s", assignment_cfg.name, task.name, f" ({len(in_flight)} in flight)" if in_flight else "")
 
             # Jobs that failed to submit hold back later tasks too, until a later run submits them
-            if task.blocking and (self.grading_state.task_jobs(assignment_cfg.name, task.name) or task_deferred or task_failed):
+            if task.blocking and (DurableJobs(self).held_students(assignment_cfg.name, task.name) or self.grading_state.task_jobs(assignment_cfg.name, task.name) or task_deferred or task_failed):
                 blocked_by = task.name
 
         return deferred
@@ -179,18 +193,16 @@ class Grader:
                 ready.append(replace(submission, deploy_key=""))
             if not ready:
                 continue
-            try:
-                job_id = self.runner.submit(submission_grader.grade_all, task, ready, results_dir, batch_commits, bundle_paths)
-            except Exception as e:
-                # any reason for the failure that's dependent on slurm or the cluster will be tried again later
-                self.log.error("Failed to submit a grading job for %s[%s]: %s", assignment_cfg.name, task.name, str(e))
+            runs = [DurableJobs(self).ensure_run(assignment_cfg, task, submission, batch_commits[submission.ssh_url]) for submission in ready]
+            for run in runs:
+                self._attach_run_to_snapshot(run)
+            if not all(self._start_publication(run) for run in runs):
                 failed += 1
                 continue
-            students = [str(submission.student_id) for submission in ready]
-            self.grading_state.add_job(job_id, assignment_cfg.name, task.name, students, submission_grader.perf_hash, list(bundle_paths.values()))
-            for submission in ready:
-                self.grading_state.add_attempt(assignment_cfg.name, str(submission.student_id), task.name, commit_hashes[submission.ssh_url], submission_grader.perf_hash)
-            self.grading_state.save()  # right away: a run killed now must still know this job exists
+            if not DurableJobs(self).submit(submission_grader.grade_all, task, ready, results_dir, batch_commits, bundle_paths, runs):
+                failed += 1
+                continue
+
             submitted += 1
 
         deferred = len(batches) - processed
@@ -226,7 +238,7 @@ class Grader:
             return True
 
         self.log.error("Giving up on %s[%s] for student %s at commit %s: %d grading jobs ended without a result", assignment_cfg.name, task.name, student_id, commit_hash, attempts)
-        self.grading_state.record(assignment_cfg.name, task.name, {
+        result = {
             "name": student_id,
             "commit_hash": commit_hash,
             "repo_url": submission.ssh_url,
@@ -236,18 +248,23 @@ class Grader:
             "stdout": "",
             "runtimes": [],
             "data": None,
-        })
+        }
+        run = DurableJobs(self).ensure_run(assignment_cfg, task, submission, commit_hash)
+        self._attach_run_to_snapshot(run)
+        if not self._start_publication(run):
+            return True
+        self._record_run_result(run, result)
         self.grading_state.save()
         return True
 
     def _has_free_job_slot(self) -> bool:
         max_jobs = self.config.grader.max_submitted_jobs
-        return max_jobs == -1 or len(self.grading_state.jobs) < max_jobs
+        return max_jobs == -1 or DurableJobs(self).occupied() < max_jobs
 
     def _drop_finished_jobs(self) -> None:
         """Forget the jobs that have finished, logging those that didn't complete. Their students'
         results are recorded from the files they wrote; a student without one is graded again."""
-        jobs = self.grading_state.jobs
+        jobs = [job for job in self.grading_state.jobs if "submission_token" not in job]
         if not jobs:
             return
 
@@ -286,10 +303,29 @@ class Grader:
 
     def _snapshot(self, assignment_cfg: AssignmentConfig) -> tuple[list[SubmissionInfo], dict[str, str | None]]:
         if assignment_cfg.name not in self.snapshots:
-            worker = GraderWorkerAPI(self.config.grader.worker_url, self.config.grader.worker_private_key)
+            worker = self._worker()
             submissions = worker.get_submissions(assignment_cfg.name)
+            if self.config.grader.worker_discovery == "updates":
+                submissions = self._discover_updates(assignment_cfg, submissions)
             self.log.info("Found %d submissions for assignment %s", len(submissions), assignment_cfg.name)
-            self.snapshots[assignment_cfg.name] = (submissions, self._get_latest_commit_hashes(submissions))
+            # Existing unfinished snapshots already have a pinned commit. Do not
+            # require another successful network lookup merely to resume them.
+            current_fingerprints = {task.name: task.performance_hash() for task in assignment_cfg.tasks if not task.skip}
+            pinned = {sub.ssh_url: snapshot["commit_hash"] for sub in submissions
+                      for snapshot in self.grading_state.snapshots.values()
+                      if not snapshot["finished"] and snapshot["assignment"] == assignment_cfg.name
+                      and snapshot["submission_id"] == sub.id and snapshot["repo_url"] == sub.ssh_url
+                      and (snapshot["fingerprints"] == current_fingerprints or any(
+                          str(sub.student_id) in DurableJobs(self).held_students(assignment_cfg.name, task)
+                          for task in snapshot["fingerprints"]))}
+            commits = (self._get_latest_commit_hashes(s for s in submissions if s.ssh_url not in pinned)
+                       if current_fingerprints else {sub.ssh_url: None for sub in submissions})
+            commits.update(pinned)
+            self._persist_snapshots(assignment_cfg, submissions, commits)
+            if assignment_cfg.name in self._discovery_updates and all(value is not None for value in commits.values()):
+                self.grading_state.discovery[assignment_cfg.name] = self._discovery_updates.pop(assignment_cfg.name)
+                self.grading_state.save()
+            self.snapshots[assignment_cfg.name] = (submissions, commits)
         else:
             submissions, commit_hashes = self.snapshots[assignment_cfg.name]
             unresolved = [
@@ -300,6 +336,8 @@ class Grader:
             for submission in unresolved:
                 commit_hashes.pop(submission.ssh_url)
             commit_hashes.update(self._get_latest_commit_hashes(unresolved))
+            if unresolved:
+                self._persist_snapshots(assignment_cfg, unresolved, commit_hashes)
         return self.snapshots[assignment_cfg.name]
 
     def _get_latest_commit_hash(self, submission: SubmissionInfo) -> str:
@@ -332,6 +370,12 @@ class Grader:
         updated_submissions = []
 
         for submission in submissions:
+            persisted = next((snapshot for snapshot in self.grading_state.snapshots.values()
+                              if not snapshot["finished"] and snapshot["assignment"] == assignment_cfg.name
+                              and snapshot["submission_id"] == submission.id), None)
+            if persisted is not None and (persisted["repo_url"] != submission.ssh_url
+                                          or persisted["fingerprints"].get(task.name) != task.performance_hash()):
+                continue
             if submission.ssh_url not in commit_hashes:  # empty repository
                 continue
 
@@ -351,29 +395,49 @@ class Grader:
         same results are recorded again next time."""
 
         ingested = []
-        # results/<assignment>/<task>/<student_id>.json; "*.json" skips write_json_atomic's .tmp files
-        for result_path in sorted((self.wd / "results").glob("*/*/*.json")):
-            task_name, assignment_name = result_path.parent.name, result_path.parent.parent.name
+        for result_path in sorted((self.wd / "results").glob("*/*/**/*.json")):
+            relative = result_path.relative_to(self.wd / "results")
+            assignment_name, task_name = relative.parts[:2]
             try:
-                with open(result_path, 'r') as f:
-                    result: TaskGradeResult = json.load(f)
-            except (OSError, json.JSONDecodeError) as e:
-                self.log.error("Failed to read result file %s, leaving it in place: %s", result_path, str(e))
+                with open(result_path) as file:
+                    result: TaskGradeResult = json.load(file)
+                if not isinstance(result, dict):
+                    raise ValueError("Result must be an object")
+                if "perf_hash" not in result:
+                    self.log.warning("Discarding legacy result without perf_hash: %s", result_path)
+                elif "run_id" in result:
+                    run = self.grading_state.runs.get(result["run_id"])
+                    token = result.get("submission_token")
+                    intent = self.grading_state.submission_intents.get(token)
+                    valid = (run is not None and intent is not None
+                             and result["run_id"] in intent["run_ids"]
+                             and (assignment_name, task_name, result.get("submission_id"), result.get("name"),
+                                  result.get("repo_url"), result.get("commit_hash"), result.get("perf_hash")) == (
+                                      run["assignment"], run["task"], run["submission_id"], run["student_id"],
+                                      run["repo_url"], run["commit_hash"], run["perf_hash"]))
+                    if not valid:
+                        raise ValueError("Result does not match its persisted evaluation and submission intent")
+                    if run["state"] == "active":
+                        self._record_run_result(run, result)
+                    else:
+                        self.log.info("Ignoring late result for completed evaluation %s", result["run_id"])
+                else:
+                    # Preserve legacy orphan recovery, but never overwrite a newer evaluation.
+                    active = any(r["assignment"] == assignment_name and r["task"] == task_name
+                                 and r["student_id"] == result.get("name") for r in self.grading_state.runs.values())
+                    if not active:
+                        self.grading_state.record(assignment_name, task_name, result)
+                    else:
+                        self.log.warning("Ignoring legacy result covered by a newer evaluation: %s", result_path)
+            except (OSError, ValueError, KeyError, TypeError) as error:
+                self.log.error("Invalid result %s, leaving it for inspection: %s", result_path, error)
                 continue
-
-            if "perf_hash" not in result:  # perf_hash MUST be present
-                self.log.warning("Result file %s has no perf_hash, discarding it", result_path)
-            else:
-                self.grading_state.record(assignment_name, task_name, result)
             ingested.append(result_path)
-
-        if not ingested:
-            return
-
-        self.grading_state.save()
-        for result_path in ingested:
-            result_path.unlink(missing_ok=True) # delete the ingested result JUST after the grading state was saved, so a crash doesn't lose it
-        self.log.info("Recorded %d result files", len(ingested))
+        if ingested:
+            self.grading_state.save()
+            for result_path in ingested:
+                result_path.unlink(missing_ok=True)
+            self.log.info("Recorded or reconciled %d result files", len(ingested))
 
     def _publish(self) -> None:
         """Write the grades file and push it."""
@@ -396,3 +460,206 @@ class Grader:
 
     def _save_grades_file(self, data: dict) -> None:
         write_json_atomic(Path(self.config.grader.grades_file), data, indent=4)
+
+    def _worker(self):
+        if self._worker_client is None:
+            self._worker_client = GraderWorkerAPI(self.config.grader.worker_url, self.config.grader.worker_private_key)
+        return self._worker_client
+
+    def _start_publication(self, run):
+        if not self.config.grader.worker_publication:
+            return True
+        from .worker_publication import WorkerPublication
+        # A predecessor's failed publication/cancellation must resolve before a
+        # successor start; otherwise a legitimate remote 409 would block it.
+        for other in self.grading_state.runs.values():
+            if other["run_id"] == run["run_id"]:
+                break
+            if (other["submission_id"] == run["submission_id"] and other["task"] == run["task"]
+                    and other.get("worker_state") not in {"cancelled", "completed"}
+                    and not other.get("worker_obsolete")):
+                return False
+        ready = WorkerPublication(self).start(run)
+        if run.get("recovered_result") is not None:
+            self._record_run_result(run, run.pop("recovered_result"))
+            return False
+        return ready
+
+    def _flush_publications(self):
+        if self.config.grader.worker_publication:
+            from .worker_publication import WorkerPublication
+            publisher = WorkerPublication(self)
+            for run in self.grading_state.runs.values():
+                if run["state"] == "completed" and run.get("result") is not None and run["worker_state"] not in {"completed", "cancelled"}:
+                    if self._start_publication(run):
+                        publisher.enqueue(run, run["result"])
+            publisher.flush()
+
+    def _record_run_result(self, run, result):
+        # The first validated result wins, even if a presumed-absent original returns later.
+        if run["state"] != "active":
+            return
+        from .publication import build_finish_payload
+        # Validate the full result even when remote publication is disabled. Local
+        # storage has no Worker body limit; publication applies its limit separately.
+        build_finish_payload(run["submission_id"], run["task"], run["run_id"], result,
+                             reduction=run["reduction"], max_bytes=2**63 - 1)
+        self.grading_state.record(run["assignment"], run["task"], result)
+        run["state"] = "completed"
+        run["result"] = result
+        if self.config.grader.worker_publication:
+            from .worker_publication import WorkerPublication
+            WorkerPublication(self).enqueue(run, result)
+        self.grading_state.save()
+
+    def _persist_snapshots(self, assignment, submissions, commits):
+        """Resume unfinished pinned inputs across coordinator restarts; keep credentials transient."""
+        from uuid import uuid4
+        fingerprints = {t.name: t.performance_hash() for t in assignment.tasks if not t.skip}
+        for submission in submissions:
+            previous = next((s for s in reversed(list(self.grading_state.snapshots.values()))
+                             if s["assignment"] == assignment.name and s["submission_id"] == submission.id
+                             and not s["finished"]), None)
+            if previous is not None:
+                holds = any(submission.student_id is not None and str(submission.student_id) in
+                            DurableJobs(self).held_students(assignment.name, t) for t in previous["fingerprints"])
+                if (previous["repo_url"] == submission.ssh_url and previous["fingerprints"] == fingerprints) or holds:
+                    commits[submission.ssh_url] = previous["commit_hash"]
+                    continue
+                # No scheduler work can still depend on this superseded snapshot.
+                for run_id in previous["runs"].values():
+                    run = self.grading_state.runs[run_id]
+                    if run["state"] == "active":
+                        if self.config.grader.worker_publication:
+                            from .worker_publication import WorkerPublication
+                            WorkerPublication(self).cancel(run, "Task configuration or repository changed")
+                        run["state"] = "abandoned"
+                previous["finished"] = True
+            commit = commits.get(submission.ssh_url)
+            if commit is None and fingerprints:
+                continue
+            snapshot_id = str(uuid4())
+            self.grading_state.snapshots[snapshot_id] = {
+                "snapshot_id": snapshot_id, "assignment": assignment.name,
+                "submission_id": submission.id, "student_id": str(submission.student_id),
+                "repo_url": submission.ssh_url, "commit_hash": commit,
+                "update_id": submission.update_id, "fingerprints": fingerprints,
+                "runs": {}, "finished": False,
+            }
+        self.grading_state.save()
+
+    def _attach_run_to_snapshot(self, run):
+        from .grading_state import _leaderboard_name
+        run.setdefault("name", _leaderboard_name(run["repo_url"], run["student_id"]))
+        for snapshot in reversed(list(self.grading_state.snapshots.values())):
+            if (not snapshot["finished"] and snapshot["assignment"] == run["assignment"]
+                    and snapshot["submission_id"] == run["submission_id"]
+                    and snapshot["repo_url"] == run["repo_url"]
+                    and snapshot["commit_hash"] == run["commit_hash"]
+                    and snapshot["fingerprints"].get(run["task"]) == run["perf_hash"]):
+                snapshot["runs"][run["task"]] = run["run_id"]
+                # Provenance belongs to the persisted snapshot, not fresh discovery.
+                run["update_id"] = snapshot["update_id"]
+                break
+        self.grading_state.save()
+
+    def _finish_snapshots(self):
+        """Reuse published evaluations for unchanged tasks; import local legacy results without compute."""
+        for snapshot in self.grading_state.snapshots.values():
+            if snapshot["finished"]:
+                continue
+            configured = next(({t.name: t.performance_hash() for t in assignment.tasks if not t.skip}
+                               for assignment in self.config.assignments if assignment.name == snapshot["assignment"]), {})
+            current_submission = next((sub for sub in self.snapshots.get(snapshot["assignment"], ([], {}))[0]
+                                       if sub.id == snapshot["submission_id"]), None)
+            repository_changed = current_submission is not None and current_submission.ssh_url != snapshot["repo_url"]
+            if configured != snapshot["fingerprints"] or repository_changed:
+                if not any(snapshot["student_id"] in DurableJobs(self).held_students(snapshot["assignment"], task)
+                           for task in snapshot["fingerprints"]):
+                    for run_id in snapshot["runs"].values():
+                        run = self.grading_state.runs[run_id]
+                        if run["state"] == "active":
+                            if self.config.grader.worker_publication:
+                                from .worker_publication import WorkerPublication
+                                WorkerPublication(self).cancel(run, "Task configuration changed during evaluation")
+                            run["state"] = "abandoned"
+                    snapshot["finished"] = True
+                continue
+            for task, fingerprint in snapshot["fingerprints"].items():
+                if task in snapshot["runs"]:
+                    continue
+                record = self.grading_state.records.get(snapshot["assignment"], {}).get(snapshot["student_id"], {}).get(task)
+                if record is None or (record["repo_url"], record["commit_hash"], record["perf_hash"]) != (
+                        snapshot["repo_url"], snapshot["commit_hash"], fingerprint):
+                    continue
+                run = next((r for r in reversed(list(self.grading_state.runs.values()))
+                            if r["assignment"] == snapshot["assignment"] and r["task"] == task
+                            and r["submission_id"] == snapshot["submission_id"]
+                            and (r["repo_url"], r["commit_hash"], r["perf_hash"]) == (
+                                snapshot["repo_url"], snapshot["commit_hash"], fingerprint)
+                            and r["state"] == "completed"), None)
+                if run is not None:
+                    snapshot["runs"][task] = run["run_id"]
+                elif self.config.grader.worker_publication:
+                    # Import only exact recorded inputs; never label an old result with a new hash.
+                    from uuid import uuid4
+                    from .grading_state import _leaderboard_name
+                    run_id = str(uuid4())
+                    reduction = next((t.reduction or "mean" for a in self.config.assignments
+                                      if a.name == snapshot["assignment"] for t in a.tasks if t.name == task), "mean")
+                    run = {
+                        "run_id": run_id, "assignment": snapshot["assignment"], "task": task,
+                        "submission_id": snapshot["submission_id"], "student_id": snapshot["student_id"],
+                        "repo_url": record["repo_url"], "commit_hash": record["commit_hash"],
+                        "perf_hash": fingerprint, "reduction": reduction, "state": "active",
+                        "attempts": 0, "recoveries": 0, "update_id": snapshot["update_id"],
+                        "worker_state": "unstarted", "name": _leaderboard_name(record["repo_url"], snapshot["student_id"]),
+                        "result": dict(record, name=snapshot["student_id"]), "imported": True,
+                    }
+                    self.grading_state.runs[run_id] = run
+                    snapshot["runs"][task] = run_id
+                    self.grading_state.save()
+            # Imported grades require publication but never enter the scheduler.
+            for run_id in snapshot["runs"].values():
+                run = self.grading_state.runs[run_id]
+                if run.get("imported") and run["state"] == "active" and self._start_publication(run):
+                    self._record_run_result(run, run["result"])
+            computed = all(task in snapshot["runs"] and self.grading_state.runs[snapshot["runs"][task]]["state"] == "completed"
+                           for task in snapshot["fingerprints"])
+            if not self.config.grader.worker_publication:
+                # Local legacy results are sufficient when no remote evidence is required.
+                computed = all((r := self.grading_state.records.get(snapshot["assignment"], {}).get(snapshot["student_id"], {}).get(task))
+                               and (r["repo_url"], r["commit_hash"], r["perf_hash"]) == (snapshot["repo_url"], snapshot["commit_hash"], fp)
+                               for task, fp in snapshot["fingerprints"].items())
+            published = all(self.grading_state.runs[r]["worker_state"] == "completed" for r in snapshot["runs"].values())
+            if computed and (not self.config.grader.worker_publication or published):
+                if self.config.grader.worker_publication and snapshot["update_id"] is not None:
+                    from .worker_publication import WorkerPublication
+                    WorkerPublication(self).enqueue_ack(snapshot)
+                snapshot["finished"] = True
+        self.grading_state.save()
+
+    def _discover_updates(self, assignment, submissions):
+        """Use webhooks as a hint; new/changed tasks and periodic scans remain authoritative."""
+        fingerprints = {task.name: task.performance_hash() for task in assignment.tasks if not task.skip}
+        prior = self.grading_state.discovery.get(assignment.name)
+        current_time = datetime.now(timezone.utc)
+        full = (prior is None or prior["fingerprints"] != fingerprints or
+                (current_time - datetime.fromisoformat(prior["last_full_scan"])).total_seconds()
+                >= self.config.grader.worker_reconcile_seconds)
+        updates = {submission.id: submission for submission in self._worker().get_updates(assignment.name)}
+        unfinished = {s["submission_id"] for s in self.grading_state.snapshots.values()
+                      if s["assignment"] == assignment.name and not s["finished"]}
+        selected = []
+        for submission in submissions:
+            pending = updates.get(submission.id)
+            if pending is not None:
+                submission = replace(submission, update_id=pending.update_id)
+            unknown = str(submission.student_id) not in self.grading_state.records.get(assignment.name, {})
+            if full or pending is not None or submission.id in unfinished or unknown:
+                selected.append(submission)
+        if full:
+            self._discovery_updates[assignment.name] = {
+                "fingerprints": fingerprints, "last_full_scan": current_time.isoformat(),
+            }
+        return selected

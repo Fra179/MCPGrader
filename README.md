@@ -36,12 +36,13 @@ This grading system automates the process of:
 - **Per-Student Deploy Keys**: Clones private repositories without a GitHub token, using the read-only deploy key the worker generated for each repository
 - **SLURM Support**: Execute test scripts with configurable SLURM resources (CPU, memory, GPUs, etc.)
 - **Performance Metrics**: Collects runtime statistics from test scripts
-- **Incremental Grading**: Only re-grades repositories whose latest commit changed since the last run
+- **Incremental Grading**: Re-grades changed commits, repositories or task fingerprints; optional push notifications reduce HEAD lookups
 - **Blocking Tasks**: Hold back an assignment's later tasks until a task is fully graded
 - **Restartable Runs**: A run can be killed at any point; the next one picks up the jobs and results it left
 - **Repository Cleanup**: Option to preserve or delete cloned repositories
 - **Leaderboard Generation**: JSON output with all results and metrics
-- **GitHub Integration**: Push leaderboard results directly to a GitHub repository
+- **Worker Publication**: Optionally publish individual task results and acknowledge pushes through the Worker run API
+- **GitHub Integration**: Optionally push leaderboard results directly to a GitHub repository
 
 ## Installation
 
@@ -77,6 +78,11 @@ grader:
   max_submitted_jobs: -1
   job_mode: "per_task"
   wait_for_jobs: true
+  worker_publication: false
+  worker_discovery: "submissions"
+  worker_reconcile_seconds: 3600
+  submission_grace_seconds: 600
+  max_submission_recoveries: 3
 ```
 
 **Field Explanations:**
@@ -86,9 +92,15 @@ grader:
 - **`worker_url`** (required): Base URL of the grader worker.
 - **`worker_private_key`** (required): Path to the ECDSA P-256 admin private key (PEM) used to sign requests to the worker. This file must exist before running the grader. See [Admin Key](#admin-key).
 - **`sentry_dsn`**: (Optional) Sentry DSN for error tracking and monitoring. Failed HEAD lookups (after three attempts) and repository downloads generate an explicit error event, once per submission and download stage per run, with assignment, student ID, repository URL and error details. Deploy keys and exception locals are not attached. Leave empty if not using Sentry.
-- **`max_submitted_jobs`** (default: `-1`, no limit): At most this many grading jobs are queued or running on the cluster at once, across all tasks and assignments. Extra jobs are submitted by later passes as earlier ones finish (by the next run, with `wait_for_jobs: false`), so the cluster's per-user job limit isn't hit. Jobs from earlier runs that are still in flight count too. It only counts the grader's own jobs: if the same user submits other jobs, leave some margin. A job the cluster still refuses is logged, and its students are retried on the next run.
+- **`max_submitted_jobs`** (default: `-1`, no limit): At most this many grading jobs are queued or running on the cluster at once, across all tasks and assignments. Extra jobs are submitted by later passes as earlier ones finish (by the next run, with `wait_for_jobs: false`), so the cluster's per-user job limit isn't hit. Jobs from earlier runs that are still in flight count too. It only counts the grader's own jobs: if the same user submits other jobs, leave some margin. Uncertain submissions reserve a slot while the grader reconciles them; definite local validation failures do not consume an accepted-job attempt.
 - **`job_mode`** (default: `"per_task"`): `"per_task"` grades all of a task's updated submissions one after another in a single job; `"per_submission"` launches one job per (student, task) for maximum parallelism. With `"per_submission"`, a task's `timeout_min` must cover a single student instead of all of them, and you'll usually want `max_submitted_jobs` set.
-- **`wait_for_jobs`** (default: `true`): The grader works in passes: each pass records the results written so far, forgets jobs that have finished, and submits jobs for submissions that need grading. With `true`, a run repeats passes every 30 seconds until no job is in flight and nothing is left to submit. With `false`, a run makes a single pass and exits without waiting for its jobs: the next run records their results. Either way, the leaderboard is written (and pushed) once, when the run ends. Use `false` when the grader is started on a schedule, e.g. every 10 minutes.
+- **`wait_for_jobs`** (default: `true`): The grader works in passes: each pass records the results written so far, forgets jobs that have finished, and submits jobs for submissions that need grading. With `true`, a run repeats passes every 30 seconds until no job is in flight and nothing is left to submit. With `false`, a run makes a single pass and exits without waiting for its jobs: the next run records their results. Either way, the local leaderboard is written (and optionally pushed to GitHub) once, when the run ends. Worker publication, when enabled, is retried during each pass; publication-only failures do not keep a waiting run alive. Use `false` when the grader is started on a schedule, e.g. every 10 minutes.
+
+- **`worker_publication`** (default: `false`): Enable the Worker's run-based start, completion, cancellation, inspection and acknowledgement API. Deploy that API separately before enabling this flag; this repository changes only the grader. Results and pending publication bodies are saved locally before result files are deleted. Transient failures retry on later passes or scheduled runs without regrading a completed evaluation. Invalid/conflicting requests remain blocked for inspection. GitHub publication remains independently optional.
+- **`worker_discovery`** (default: `"submissions"`): `"submissions"` checks repository HEADs from `/submissions`. `"updates"` requires `worker_publication: true`; it still reads `/submissions` for metadata and uses `/updates` to select pending pushes for HEAD lookup. Unfinished snapshots and students without records are included, with full scans on task changes and at `worker_reconcile_seconds` intervals. Push notifications are hints, so an absent notification cannot permanently prevent task-change regrading. `update_id` provenance may be null when discovery provides no push version.
+- **`worker_reconcile_seconds`** (default: `3600`): Positive interval between full HEAD scans in updates mode.
+- **`submission_grace_seconds`** (default: `600`): Continuous period of successful, empty live-queue and accounting lookups required before an uncertain SLURM submission may be retried. Failed queries reset this period. See [Scheduler recovery](#scheduler-recovery).
+- **`max_submission_recoveries`** (default: `3`): Maximum presumed-absent submission recoveries per evaluation. At the cap, the grader holds that work and its reserved capacity for operator review rather than retrying indefinitely. This budget is separate from the three confirmed grading attempts.
 
 ### Step 3: Configure the Pusher Section
 
@@ -286,17 +298,35 @@ The grader works in passes (see `wait_for_jobs`). In each pass it will:
 
 When the run ends, it writes the leaderboard to the `grades_file` and pushes it (the push is skipped if the leaderboard didn't change).
 
-Submissions and their latest commits are snapshotted once per run. Jobs explicitly check out the snapshotted commit, so every task grades that commit even if the student pushes before the job starts; later commits are picked up by the next run. Failed HEAD lookups are retried up to three times before submission. Submissions whose HEAD still cannot be resolved are skipped until a later pass or run; successful lookups stay fixed for the run. If the pinned commit is missing from the coordinator's download, the coordinator tries to fetch it explicitly before creating the bundle. Download/fetch failures are logged and reported to Sentry when configured; the affected repository/commit is skipped for the rest of the run and retried on the next run. These failures submit no grading jobs, consume no grading attempts, and leave existing grades unchanged. Other submissions can still be graded; a failed download for a blocking task holds back later tasks in that assignment.
+Submissions and their latest commits are pinned in persistent snapshots. An unfinished snapshot resumes after coordinator restart before a newer push is graded. Jobs explicitly check out the snapshotted commit, so every task grades that commit even if the student pushes before the job starts; later commits are picked up by the next run. Failed HEAD lookups are retried up to three times before submission. Submissions whose HEAD still cannot be resolved are skipped until a later pass or run; successful lookups stay fixed for the snapshot. If the pinned commit is missing from the coordinator's download, the coordinator tries to fetch it explicitly before creating the bundle. Download/fetch failures are logged and reported to Sentry when configured; the affected repository/commit is skipped for the rest of the run and retried on the next run. These failures submit no grading jobs, consume no grading attempts, and leave existing grades unchanged. Other submissions can still be graded; a failed download for a blocking task holds back later tasks in that assignment.
 
-Bundles are identified by repository URL and commit, shared across tasks, and retained while any job in `grading_state.json` references them. Each pass removes unreferenced bundles after submitting new work, so queued jobs survive coordinator restarts. The coordinator and jobs must see `working_dir` at the same absolute path. Jobs submitted before this change keep their legacy remote-cloning behavior, and their old submitit pickles still contain deploy keys.
+Bundles are identified by repository URL and commit, shared across tasks, and retained while any job or unresolved submission intent in `grading_state.json` references them. Each pass removes unreferenced bundles after submitting new work, so queued jobs survive coordinator restarts. Presumed-absent intents keep their bundles until terminal discovery; this retention can be indefinite. The coordinator and jobs must see `working_dir` at the same absolute path. Jobs submitted before this change keep their legacy remote-cloning behavior, and their old submitit pickles still contain deploy keys.
 
 On Leonardo, run the coordinator on `lrd_all_serial` (GitHub HTTPS and SSH were verified there); DCGP and Booster jobs use the shared bundles. The worker endpoint and scheduler commands must also be reachable from the coordinator. Git bundles contain committed Git files and history; Git LFS objects and submodule repositories are not downloaded automatically.
 
-The jobs in flight are kept in `grading_state.json`, so a run killed at any point loses nothing: the next one waits for those jobs and records their results instead of grading the same students again.
+State version 2 stores records, jobs, pinned snapshots, evaluation runs, scheduler submission intents and the publication outbox together in `grading_state.json`. Version 1 files load automatically and upgrade on the next save; existing grades and legacy jobs remain usable. Back up the state before deployment. New jobs carry evaluation and submission identities, and the first validated result recorded for an evaluation wins. Each attempt has its own clone directory under `<working_dir>/attempts/` and result directory under `<working_dir>/results/<assignment>/<task>/<token>/`, so a delayed attempt cannot overwrite its replacement's files.
 
 Only one run at a time works on a `working_dir`: a run holds a lock on `<working_dir>/grader.lock` until it ends, and a run started meanwhile logs who holds it and exits, so a schedule can start the grader as often as it likes. The lock is released when the run ends or dies, even with `kill -9` or at a SLURM time limit. At startup, `main.py` checks that locking works in `working_dir` and, on Lustre or NFS, that locks are shared across nodes; it refuses to run otherwise.
 
 A submission whose grading jobs end 3 times without producing its result (the job crashed, was killed or hit `timeout_min`, or the repository couldn't be cloned) gets an `error` result instead of another job. A new commit or a change to the task tries again.
+
+### Scheduler recovery
+
+Before contacting SLURM, the coordinator saves a submission token and its batch membership. New job names are `gw-<32-character token>`; these override task-configured human-readable job names. If the coordinator crashes around submission, it searches `squeue` and `sacct` by the full name, submission time range, user and saved account/cluster scope, adopting discovered allocations instead of immediately submitting again.
+
+If both lookups succeed and no allocation or result appears throughout `submission_grace_seconds`, the intent becomes presumed absent. A retry uses a new token within the same Worker run. A query failure restarts the absence period. Sustained absence is a practical assumption: an original job can still appear late, so duplicate compute remains possible. Attempts have isolated files, late results are validated against their pinned run and token, and subsequent results cannot replace a selected result. Confirmed jobs that fail without results still reach the existing three-attempt error cap; missing-submission recovery has the separate `max_submission_recoveries` budget.
+
+Recovery exhaustion or conflicting allocations can hold a batch and its reserved job slots for operator intervention. Inspect `grading_state.json`, scheduler records and logs to establish whether work is still running before changing state or deleting input bundles. There is no new recovery CLI. Presumed-absent bundles can consume disk indefinitely until terminal discovery or deliberate operator reconciliation; include them in storage monitoring and cleanup policy.
+
+Without SLURM, local submission receipts under `slurm_logs/submission_receipts/` recover job IDs after restart and record process start identity to detect PID reuse. If a receipt is missing, automatic absence-based recovery is unsupported locally: the runner reports uncertainty rather than pretending to have queried SLURM.
+
+The scheduler recovery paths have local mocked regression coverage, but have not been verified on Leonardo. Before deployment, use a scratch job to verify exact `gw-<token>` lookup through both `squeue` and `sacct` (including after completion), full names and saved account/cluster scope. Verify Worker connectivity, scheduler access and shared locks from the coordinator node too.
+
+### Worker publication rollout
+
+Keep `worker_publication: false` until the separately deployed Worker implements the agreed run contract: `POST /updates/grading`, `/updates/graded`, `/updates/cancelled`, `/updates/acknowledged`, and `GET /grading` inspection. Start with `worker_discovery: "submissions"`, then enable `"updates"` once its `GET /updates` behavior is available. One Worker run represents a final task evaluation across scheduler retries; push versions and task fingerprints are separate identities. A later push at unchanged inputs can be acknowledged with an existing completed run, without repeating compute.
+
+The coordinator saves immutable publication bodies in its outbox and retries transient failures. Permanent validation/conflict/size failures require inspection and never trigger another compute job for an already recorded result. The local leaderboard and optional GitHub push remain available alongside Worker publication.
 
 ### Recovering from earlier compute-node download failures
 

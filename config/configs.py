@@ -117,6 +117,11 @@ class GraderConfig:
     max_submitted_jobs: int = -1 # at most this many grading jobs queued or running at once; -1 = no limit
     job_mode: str = "per_task" # "per_task": one job per task; "per_submission": one job per (student, task)
     wait_for_jobs: bool = True # repeat passes until every job is done; false = one pass, for runs started on a schedule
+    worker_publication: bool = False # requires the Worker's run-based grading API
+    worker_discovery: str = "submissions" # "updates" reduces HEAD lookups, with periodic full reconciliation
+    worker_reconcile_seconds: int = 3600
+    submission_grace_seconds: int = 600 # continuous successful absence before retrying an uncertain SLURM submission
+    max_submission_recoveries: int = 3 # presumed-absent submissions per evaluation before stopping for reconciliation
 
     def assert_valid(self) -> None:
         assert isinstance(self.working_dir, str) and self.working_dir, "working_dir must be a non-empty string"
@@ -129,6 +134,12 @@ class GraderConfig:
         assert isinstance(self.max_submitted_jobs, int) and (self.max_submitted_jobs == -1 or self.max_submitted_jobs >= 1), "max_submitted_jobs must be -1 (no limit) or a positive integer"
         assert self.job_mode in JOB_MODES, f"job_mode must be one of {JOB_MODES}"
         assert isinstance(self.wait_for_jobs, bool), "wait_for_jobs must be a boolean"
+        assert isinstance(self.worker_publication, bool), "worker_publication must be a boolean"
+        assert self.worker_discovery in {"submissions", "updates"}, "worker_discovery must be submissions or updates"
+        assert self.worker_discovery != "updates" or self.worker_publication, "updates discovery requires worker_publication"
+        assert type(self.worker_reconcile_seconds) is int and self.worker_reconcile_seconds > 0, "worker_reconcile_seconds must be a positive integer"
+        assert type(self.submission_grace_seconds) is int and self.submission_grace_seconds > 0, "submission_grace_seconds must be a positive integer"
+        assert type(self.max_submission_recoveries) is int and self.max_submission_recoveries > 0, "max_submission_recoveries must be a positive integer"
 
 
 @dataclass_json

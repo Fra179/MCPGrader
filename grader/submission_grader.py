@@ -1,3 +1,4 @@
+import hashlib
 import json
 import logging
 import os
@@ -5,6 +6,7 @@ import signal
 import subprocess
 import time
 from pathlib import Path
+from uuid import UUID
 from shutil import copyfile, rmtree
 
 from git import Repo, exc
@@ -36,7 +38,7 @@ class SubmissionGrader:
         self.log_level = log_level
         self.log = logging.getLogger(f"grader.task.{task.name}")  # handlers are attached in the job
 
-    def grade_all(self, submissions: list[SubmissionInfo], results_dir: Path, commit_hashes: dict[str, str] | None = None, bundle_paths: dict[str, str] | None = None) -> None:
+    def grade_all(self, submissions: list[SubmissionInfo], results_dir: Path, commit_hashes: dict[str, str] | None = None, bundle_paths: dict[str, str] | None = None, run_ids: dict[str, str] | None = None, submission_token: str | None = None) -> None:
         """Entry point of the SLURM job: grade each submission and write its result file."""
         # Each result is written to results_dir as soon as it's ready, so if the job dies
         # only the submission being graded at that moment is lost
@@ -45,22 +47,43 @@ class SubmissionGrader:
         if task_id != 0:
             return
 
+        if (run_ids is None) != (submission_token is None):
+            raise ValueError("Run IDs and submission token must be supplied together")
+
         self.log = build_logger(name=self.log.name, level=self.log_level)
 
         for submission in submissions:
             try:
                 commit_hash = commit_hashes[submission.ssh_url] if commit_hashes is not None else None
                 bundle = Path(bundle_paths[submission.ssh_url]) if bundle_paths is not None else None
-                res = self.grade(submission, commit_hash, bundle)
-                write_json_atomic(results_dir / f"{res['name']}.json", res)
+                if submission_token is None:
+                    res = self.grade(submission, commit_hash, bundle)
+                    destination = results_dir / f"{res['name']}.json"
+                else:
+                    run_id = run_ids[submission.ssh_url]
+                    res = self.grade(submission, commit_hash, bundle, submission_token)
+                    res.update(submission_id=submission.id, run_id=run_id, submission_token=submission_token)
+                    destination = results_dir / self._path_identity(submission_token) / f"{self._path_identity(submission.id)}.json"
+                    destination.parent.mkdir(parents=True, exist_ok=True)
+                write_json_atomic(destination, res)
             except Exception as e:
                 self.log.error("Failed to grade submission %s[%s]: %s", submission.repo_url, self.task.name, str(e))
             finally:
                 # Delete each clone right away, so a job holds at most one on disk
                 if not self.preserve_repo_files:
-                    rmtree(self.repo_dir(submission), ignore_errors=True)
+                    rmtree(self.repo_dir(submission, submission_token), ignore_errors=True)
 
-    def repo_dir(self, submission: SubmissionInfo) -> Path:
+    @staticmethod
+    def _path_identity(identity: str) -> str:
+        """Keep UUIDs readable; hash other identities so they cannot escape their directory."""
+        try:
+            return str(UUID(identity))
+        except ValueError:
+            return hashlib.sha256(identity.encode()).hexdigest()
+
+    def repo_dir(self, submission: SubmissionInfo, submission_token: str | None = None) -> Path:
+        if submission_token is not None:
+            return self.workdir / "attempts" / self._path_identity(submission_token) / self._path_identity(submission.id)
         # TODO (not urgent): use a more resistant dir name like submission UUID + task
         # replacing '/' to '_' makes course_group/solution and course/group_solution (for example).
         return self.workdir / (self._repo_full_name(submission).replace('/', '_') + f"_{self.task.name}")
@@ -68,10 +91,10 @@ class SubmissionGrader:
     def _repo_full_name(self, submission: SubmissionInfo) -> str:
         return submission.ssh_url.split(":", 1)[1].removesuffix(".git")
 
-    def grade(self, submission: SubmissionInfo, commit_hash: str | None = None, bundle: Path | None = None) -> TaskGradeResult:
+    def grade(self, submission: SubmissionInfo, commit_hash: str | None = None, bundle: Path | None = None, submission_token: str | None = None) -> TaskGradeResult:
         """Clone the submission and grade the requested snapshot commit (HEAD for legacy jobs)."""
         self.log.info("Grading submission for %s[%s]", self._repo_full_name(submission), self.task.name)
-        repo_dir = self.repo_dir(submission)
+        repo_dir = self.repo_dir(submission, submission_token)
         commit_hash = self._clone_repo(submission, repo_dir, commit_hash, bundle)
         return self._grade_cloned(submission, commit_hash, repo_dir)
 

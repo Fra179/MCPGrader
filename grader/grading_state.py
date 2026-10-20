@@ -10,7 +10,7 @@ from grader_worker import SubmissionInfo
 from .structs import TaskGradeResult
 from .utils import write_json_atomic
 
-STATE_VERSION = 1
+STATE_VERSION = 2
 
 # Key aliases, for readability only: a type checker treats them all as str
 type AssignmentName = str
@@ -82,15 +82,26 @@ class GradingState:
         self.records: Records = {}
         self.jobs: list[JobRecord] = []
         self.attempts: Attempts = {}
+        # These contain only pinned inputs and publication data, never deploy keys.
+        self.runs: dict[str, dict[str, Any]] = {}
+        self.submission_intents: dict[str, dict[str, Any]] = {}
+        self.snapshots: dict[str, dict[str, Any]] = {}
+        self.outbox: dict[str, dict[str, Any]] = {}
+        self.discovery: dict[str, dict[str, Any]] = {}
 
         if path.exists():
             with open(path, 'r') as f:
                 saved = json.load(f)
-            if saved.get("version") != STATE_VERSION:
+            if saved.get("version") not in (1, STATE_VERSION):
                 raise ValueError(f"{path} has grading state version {saved.get('version')}, expected {STATE_VERSION}")
             self.records = saved["records"]
             self.jobs = saved.get("jobs", [])  # absent in files written before jobs were tracked
             self.attempts = saved.get("attempts", {})
+            self.runs = saved.get("runs", {})
+            self.submission_intents = saved.get("submission_intents", {})
+            self.snapshots = saved.get("snapshots", {})
+            self.outbox = saved.get("outbox", {})
+            self.discovery = saved.get("discovery", {})
 
     def needs_grading(self, assignment_name: AssignmentName, task: AssignmentTaskConfig, submission: SubmissionInfo, commit_hash: str) -> bool:
         """True unless this exact commit of this repository was graded with the task's current configuration."""
@@ -154,7 +165,13 @@ class GradingState:
         return [job for job in self.jobs if job["assignment"] == assignment_name and job["task"] == task_name]
 
     def save(self) -> None:
-        write_json_atomic(self.path, {"version": STATE_VERSION, "records": self.records, "jobs": self.jobs, "attempts": self.attempts}, indent=4)
+        write_json_atomic(self.path, {
+            "version": STATE_VERSION, "records": self.records, "jobs": self.jobs,
+            "attempts": self.attempts, "runs": self.runs,
+            "submission_intents": self.submission_intents, "snapshots": self.snapshots,
+            "outbox": self.outbox,
+            "discovery": self.discovery,
+        }, indent=4)
 
     def export_leaderboard(self, config: ProgramConfig) -> dict[AssignmentName, list[dict[str, Any]]]:
         """The leaderboard JSON: per assignment, one entry per student with per-task sub-dicts.

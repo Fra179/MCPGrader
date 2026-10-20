@@ -7,6 +7,11 @@ grader:
   max_submitted_jobs: -1 # jobs queued or running at once; -1 = no limit
   job_mode: "per_task" # or "per_submission": one job per (student, task)
   wait_for_jobs: true # false = one pass and exit, the next run records the results (for runs on a schedule)
+  worker_publication: false # enable only after deploying the Worker's run-based grading API
+  worker_discovery: "submissions" # "updates" requires worker_publication; still reconciles against /submissions
+  worker_reconcile_seconds: 3600 # full HEAD scan interval in updates mode; task changes also force a scan
+  submission_grace_seconds: 600 # continuous successful absence in squeue AND sacct before retry
+  max_submission_recoveries: 3 # missing-submission recovery cap; holds work for operator review at the cap
 
 pusher:
   github_repo: "user/MCPLeaderboard"

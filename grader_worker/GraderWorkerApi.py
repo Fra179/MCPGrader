@@ -3,13 +3,13 @@ import hashlib
 import json
 import time
 from typing import Any, Optional
+from urllib.parse import urlencode
 
 import requests
 from cryptography.hazmat.primitives import hashes, serialization
 from cryptography.hazmat.primitives.asymmetric import ec
 from cryptography.hazmat.primitives.asymmetric.utils import decode_dss_signature
 from requests.adapters import HTTPAdapter
-from urllib3.util.retry import Retry
 from .structs import SubmissionInfo
 from .exceptions import GraderWorkerException
 
@@ -30,17 +30,15 @@ class GraderWorkerAPI:
             raise GraderWorkerException(f"{private_key_file} is not an ECDSA P-256 private key")
         self.private_key = key
         self.timeout = timeout
+        if max_retries < 0:
+            raise ValueError("max_retries must be nonnegative")
+        self.max_retries = max_retries
         self.session = self.__setup_request_session(max_retries)
 
     def __setup_request_session(self, max_retries: int) -> requests.Session:
         session = requests.Session()
-        retry_strategy = Retry(
-            total=max_retries,
-            backoff_factor=1.0,
-            status_forcelist=[429, 500, 502, 503, 504],
-            allowed_methods=["GET", "POST"],  # only read-only endpoints are called
-        )
-        adapter = HTTPAdapter(max_retries=retry_strategy)
+        # Retry here, above signing: adapter retries would reuse an expired timestamp.
+        adapter = HTTPAdapter(max_retries=0)
         session.mount("https://", adapter)
         session.mount("http://", adapter)
         session.headers.update({
@@ -60,28 +58,52 @@ class GraderWorkerAPI:
             "X-Grader-Signature": base64.b64encode(signature).decode("ascii"),
         }
 
-    def __post_request(self, path: str, payload: dict[str, Any]) -> dict:
-        body = json.dumps(payload).encode("utf-8")  # serialized once, so the signed bytes are the sent bytes
-        headers = {"Content-Type": "application/json", **self.__sign("POST", path, body)}
+    def __request(self, method: str, path: str, payload: dict[str, Any] | None = None) -> dict:
+        body = (json.dumps(payload, ensure_ascii=False, separators=(",", ":"), allow_nan=False).encode("utf-8")
+                if payload is not None else b"")
         url = self.base_url + path
-        response = self.session.post(url, data=body, headers=headers, timeout=self.timeout)
-        if not response.ok:
+        for attempt in range(self.max_retries + 1):
+            headers = {"Content-Type": "application/json", **self.__sign(method, path, body)}
             try:
-                error = response.json().get("error", response.text)
+                response = self.session.request(method, url, data=body, headers=headers, timeout=self.timeout,
+                                                allow_redirects=False)
+            except requests.RequestException as exc:
+                if attempt == self.max_retries:
+                    raise GraderWorkerException(f"Grader worker request to '{url}' failed in transit") from exc
+            else:
+                if response.status_code not in {429, 500, 502, 503, 504} or attempt == self.max_retries:
+                    break
+                response.close()
+            time.sleep(2 ** attempt)
+        if not 200 <= response.status_code < 300:
+            try:
+                decoded = response.json()
+                error = decoded.get("error", response.text) if isinstance(decoded, dict) else response.text
             except ValueError:
                 error = response.text
             raise GraderWorkerException(
-                f"Grader worker request to '{url}' failed ({response.status_code}): {error}"
+                f"Grader worker request to '{url}' failed ({response.status_code}): {error}",
+                status_code=response.status_code,
             )
-        return response.json()
+        try:
+            decoded = response.json()
+        except ValueError as exc:
+            raise GraderWorkerException("Grader worker returned invalid JSON", response.status_code) from exc
+        if not isinstance(decoded, dict):
+            raise GraderWorkerException("Grader worker returned a non-object response", response.status_code)
+        return decoded
 
     def list_submissions(self, assignment_name: Optional[str] = None) -> list[dict[str, Any]]:
         """Raw submissions of an assignment (all assignments if None), oldest first."""
         payload = {"assignment_name": assignment_name} if assignment_name else {}
-        return self.__post_request("/submissions", payload)["submissions"]
+        return self.__request("POST", "/submissions", payload)["submissions"]
 
     def get_submissions(self, assignment_name: Optional[str] = None) -> list[SubmissionInfo]:
         """Retrieve the submissions of an assignment (all assignments if None) as SubmissionInfo objects."""
+        return self._submission_infos(self.list_submissions(assignment_name))
+
+    @staticmethod
+    def _submission_infos(submissions: list[dict[str, Any]]) -> list[SubmissionInfo]:
         return [
             SubmissionInfo(
                 id=s["id"],
@@ -93,9 +115,38 @@ class GraderWorkerAPI:
                 deploy_key=s["private_key"],
                 last_push=s.get("last_push"),
                 last_commit=s.get("last_commit"),
+                update_id=s.get("update_id"),
             )
-            for s in self.list_submissions(assignment_name)
+            for s in submissions
         ]
+
+    def list_updates(self) -> list[dict[str, Any]]:
+        """Read pending push notifications without consuming them."""
+        return self.__request("GET", "/updates")["submissions"]
+
+    def get_updates(self, assignment_name: str | None = None) -> list[SubmissionInfo]:
+        submissions = self.list_updates()
+        if assignment_name is not None:
+            submissions = [s for s in submissions if s["assignment_name"] == assignment_name]
+        return self._submission_infos(submissions)
+
+    def start_run(self, payload: dict[str, Any]) -> dict:
+        return self.__request("POST", "/updates/grading", payload)
+
+    def finish_run(self, payload: dict[str, Any]) -> dict:
+        return self.__request("POST", "/updates/graded", payload)
+
+    def cancel_run(self, payload: dict[str, Any]) -> dict:
+        return self.__request("POST", "/updates/cancelled", payload)
+
+    def inspect_run(self, run_id: str) -> dict:
+        return self.__request("GET", "/grading?" + urlencode({"run_id": run_id}))
+
+    def inspect_submission(self, submission_id: str) -> dict:
+        return self.__request("GET", "/grading?" + urlencode({"id": submission_id}))
+
+    def acknowledge_update(self, payload: dict[str, Any]) -> dict:
+        return self.__request("POST", "/updates/acknowledged", payload)
 
 
 if __name__ == "__main__":

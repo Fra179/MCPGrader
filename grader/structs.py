@@ -1,4 +1,4 @@
-from typing import Any, TypedDict
+from typing import Any, NotRequired, TypedDict
 
 class TaskGradeResult(TypedDict):
     name: str
@@ -10,3 +10,6 @@ class TaskGradeResult(TypedDict):
     stdout: str
     runtimes: list[float]
     data: dict[str, Any] | None
+    submission_id: NotRequired[str]
+    run_id: NotRequired[str]
+    submission_token: NotRequired[str]
