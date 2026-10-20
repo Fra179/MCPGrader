@@ -39,6 +39,7 @@ class AssignmentTaskConfig:
     reduction: Optional[str] = None
     submission_timeout: Optional[int] = None # seconds; the test script is killed after this long
     setup_script: Optional[str] = None # trusted Bash script sourced before each grading script
+    grading_cooldown_seconds: int = 0 # minimum delay after recording this student's previous task result
     __performance_hash: Optional[str] = None # type: ignore
 
     def assert_valid(self) -> None:
@@ -55,6 +56,7 @@ class AssignmentTaskConfig:
         if self.reduction is not None:
             assert self.reduction in AGG_NAME_TO_CLASS, f"reduction {self.reduction} is not supported"
         assert self.submission_timeout is None or (isinstance(self.submission_timeout, int) and self.submission_timeout > 0), "submission_timeout must be a positive integer or None"
+        assert type(self.grading_cooldown_seconds) is int and self.grading_cooldown_seconds >= 0, "grading_cooldown_seconds must be a non-negative integer"
 
     def performance_hash(self) -> str:
         # Create a hash based on relevant fields for performance comparison

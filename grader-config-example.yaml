@@ -45,6 +45,7 @@ assignments:
         blocking: true
         test_script_path: "./test_scripts/test_vectorsum_gpu.sh"
         submission_timeout: 300 # seconds per student; omit for no limit
+        grading_cooldown_seconds: 0 # set to 300 for five minutes after each student's previous result
         reduction: "median" # how the reported times become avg_runtime: "mean" (default) or "median"
         slurm_backend:
           config:

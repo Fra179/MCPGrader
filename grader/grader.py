@@ -72,7 +72,7 @@ class Grader:
         self._publish()
 
     def _pass(self) -> bool:
-        """Returns whether work remains: jobs in flight, or jobs not submitted because of max_submitted_jobs."""
+        """Returns whether jobs are in flight or work is deferred by capacity or cooldown."""
         self._publication_attempts = set()
         DurableJobs(self).reconcile()
         self._drop_finished_jobs()
@@ -81,7 +81,7 @@ class Grader:
         self._ingest_results()
         self._flush_publications()
 
-        deferred = 0 # due to max_submitted_jobs these are jobs that are not yet submitted, shouldn't happen on CINECA but could happen on DI cluster
+        deferred = 0 # work waiting for job capacity or a task's grading cooldown
         for assignment in self.config.assignments:
             deferred += self._submit_assignment(assignment)
 
@@ -94,7 +94,7 @@ class Grader:
         return bool(DurableJobs(self).occupied()) or deferred > 0
 
     def _submit_assignment(self, assignment_cfg: AssignmentConfig) -> int:
-        """Submit jobs for this assignment's updated submissions; returns how many were deferred by max_submitted_jobs."""
+        """Submit updated submissions; return work deferred by job capacity or cooldown."""
         if all(task.skip for task in assignment_cfg.tasks):
             self.log.info("Skipping assignment %s: all its tasks are skipped", assignment_cfg.name)
             if self.config.grader.worker_publication:
@@ -119,10 +119,19 @@ class Grader:
             # 2. are not already being graded by a job in flight
             # 3. have not already had MAX_GRADING_ATTEMPTS jobs that ended without producing their result
             updated_submissions = []
+            cooling_down = 0
 
             for submission in self._filter_updated_submissions(assignment_cfg, task, submissions, commit_hashes):
                 if str(submission.student_id) in in_flight:
                     continue
+
+                previous = self.grading_state.records.get(assignment_cfg.name, {}).get(str(submission.student_id), {}).get(task.name)
+                if previous is not None and task.grading_cooldown_seconds:
+                    eligible_at = datetime.fromisoformat(previous["graded_at"]) + timedelta(seconds=task.grading_cooldown_seconds)
+                    if datetime.now(timezone.utc) < eligible_at:
+                        cooling_down += 1
+                        self.log.info("Grading cooldown for %s[%s] student %s until %s", assignment_cfg.name, task.name, submission.student_id, eligible_at.isoformat())
+                        continue
 
                 commit_hash = commit_hashes[submission.ssh_url]
 
@@ -130,6 +139,8 @@ class Grader:
                     continue
 
                 updated_submissions.append(submission)
+
+            deferred += cooling_down
 
             if blocked_by is not None:
                 if updated_submissions:
@@ -144,7 +155,7 @@ class Grader:
                 self.log.info("No updated submissions for task %s[%s]%s", assignment_cfg.name, task.name, f" ({len(in_flight)} in flight)" if in_flight else "")
 
             # Jobs that failed to submit hold back later tasks too, until a later run submits them
-            if task.blocking and (DurableJobs(self).held_students(assignment_cfg.name, task.name) or self.grading_state.task_jobs(assignment_cfg.name, task.name) or task_deferred or task_failed):
+            if task.blocking and (DurableJobs(self).held_students(assignment_cfg.name, task.name) or self.grading_state.task_jobs(assignment_cfg.name, task.name) or task_deferred or task_failed or cooling_down):
                 blocked_by = task.name
 
         return deferred
