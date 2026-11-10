@@ -464,10 +464,32 @@ their task environment:
 import grader_helpers
 ```
 
-The package currently provides the namespace and version (`__version__`); utility
-functions will be added as their interfaces are defined. It is independent of the
+The package is independent of the
 coordinator and uses only the Python standard library. Scripts may use their own
 Python interpreter or virtual environment.
+
+To inspect a compiled binary for evidence of OpenMP linkage:
+
+```python
+from grader_helpers import check_openmp
+
+openmp = check_openmp("./solution", timeout=10)
+if openmp["present"] is True:
+    print("OpenMP linkage evidence:", openmp["evidence"])
+else:
+    print("OpenMP linkage unknown:", openmp["checks"])
+```
+
+`check_openmp` invokes `readelf` and `nm` without executing the inspected binary.
+These tools must be available on `PATH`; missing tools, failures and timeouts are
+reported in `checks`. The timeout applies separately to each tool invocation.
+`present` is `True` when linkage evidence is found and `None` otherwise; a missing
+match does not prove absence, and linkage does not prove OpenMP regions execute.
+Symbol matches are heuristic. An optional `link_map="solution.map"` adds static
+archive-input evidence, which alone leaves `present` unknown because sections may
+have been discarded. Missing binary or map paths raise `FileNotFoundError`.
+`use_ldd=True` additionally inspects transitive shared dependencies; use it only
+with trusted executables because `ldd` can execute code.
 
 The coordinator stages a pinned copy under
 `<working_dir>/helper_packages/<content-hash>/` and prepends its parent directory
