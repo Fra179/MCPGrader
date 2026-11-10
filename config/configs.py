@@ -5,7 +5,7 @@ import hashlib
 import os
 from os import path
 from aggregation import AGG_NAME_TO_CLASS
-from grader_helpers._distribution import snapshot_sources, source_hash
+from grader_helpers._distribution import snapshot_sources
 
 JOB_MODES = ("per_task", "per_submission")
 
@@ -72,9 +72,9 @@ class AssignmentTaskConfig:
         if self.__performance_hash is not None:
             return self.__performance_hash
         
+        # Pin helper bytes for jobs, without making helper updates invalidate grades.
+        self._helper_sources()
         hasher = hashlib.sha256()
-        hasher.update(b"grader_helpers\0")
-        hasher.update(source_hash(self._helper_sources()).encode())
         hasher.update(self.name.encode('utf-8'))
         hasher.update(self.test_script_path.encode('utf-8'))
 

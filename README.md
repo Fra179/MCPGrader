@@ -499,9 +499,10 @@ ignores it). Bash scripts can use the package through a Python subprocess.
 The staged directory must be visible at the same absolute path on compute nodes;
 container execution additionally needs it mounted and its environment forwarded.
 
-Helper source changes trigger regrading for all tasks when configuration is next
-loaded. Queued jobs retain their original helper copy. Copies are retained across
-restarts; remove old copies only when no queued or running job references them.
+Helper source changes do not trigger regrading. To regrade a task after a helper
+update, change its grading script. Queued jobs retain their original helper copy.
+Copies are retained across restarts; remove old copies only when no queued or
+running job references them.
 This mechanism provides imports, not isolation from student code; normal Python
 import precedence still applies. For manual script execution, put the grader's
 repository root on `PYTHONPATH` yourself.
