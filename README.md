@@ -455,6 +455,37 @@ Systemd user timers don't require root privileges and offer more control.
 
 ## Test Script Format
 
+### Shared Python helpers
+
+Python grading scripts can import `grader_helpers` without installing it into
+their task environment:
+
+```python
+import grader_helpers
+```
+
+The package currently provides the namespace and version (`__version__`); utility
+functions will be added as their interfaces are defined. It is independent of the
+coordinator and uses only the Python standard library. Scripts may use their own
+Python interpreter or virtual environment.
+
+The coordinator stages a pinned copy under
+`<working_dir>/helper_packages/<content-hash>/` and prepends its parent directory
+to the grading process's `PYTHONPATH`, preserving any existing value. Setup scripts
+must preserve this setting, and Python must allow `PYTHONPATH` (isolated mode
+ignores it). Bash scripts can use the package through a Python subprocess.
+The staged directory must be visible at the same absolute path on compute nodes;
+container execution additionally needs it mounted and its environment forwarded.
+
+Helper source changes trigger regrading for all tasks when configuration is next
+loaded. Queued jobs retain their original helper copy. Copies are retained across
+restarts; remove old copies only when no queued or running job references them.
+This mechanism provides imports, not isolation from student code; normal Python
+import precedence still applies. For manual script execution, put the grader's
+repository root on `PYTHONPATH` yourself.
+
+### Result contract
+
 Your test scripts must output results in the following JSON format on the **last line** of stdout:
 
 ```json

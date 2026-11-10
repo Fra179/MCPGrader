@@ -5,6 +5,7 @@ import hashlib
 import os
 from os import path
 from aggregation import AGG_NAME_TO_CLASS
+from grader_helpers._distribution import snapshot_sources, source_hash
 
 JOB_MODES = ("per_task", "per_submission")
 
@@ -58,6 +59,13 @@ class AssignmentTaskConfig:
         assert self.submission_timeout is None or (isinstance(self.submission_timeout, int) and self.submission_timeout > 0), "submission_timeout must be a positive integer or None"
         assert type(self.grading_cooldown_seconds) is int and self.grading_cooldown_seconds >= 0, "grading_cooldown_seconds must be a non-negative integer"
 
+    def _helper_sources(self) -> dict[str, bytes]:
+        # Cache the exact bytes with this task, like its performance hash. Jobs must
+        # use these bytes even if the installed helpers change before submission.
+        if not hasattr(self, "_cached_helper_sources"):
+            self._cached_helper_sources = snapshot_sources()
+        return self._cached_helper_sources
+
     def performance_hash(self) -> str:
         # Create a hash based on relevant fields for performance comparison
         # If these fields change, we discard previous cached results
@@ -65,6 +73,8 @@ class AssignmentTaskConfig:
             return self.__performance_hash
         
         hasher = hashlib.sha256()
+        hasher.update(b"grader_helpers\0")
+        hasher.update(source_hash(self._helper_sources()).encode())
         hasher.update(self.name.encode('utf-8'))
         hasher.update(self.test_script_path.encode('utf-8'))
 

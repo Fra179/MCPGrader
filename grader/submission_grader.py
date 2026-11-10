@@ -16,6 +16,7 @@ from grader_worker import SubmissionInfo
 from logger import build_logger
 from .structs import TaskGradeResult
 from .utils import deploy_key_env, write_json_atomic
+from .helper_staging import stage_helpers
 
 KILL_GRACE_SECONDS = 5  # how long a timed-out test script gets after each kill signal
 
@@ -31,6 +32,7 @@ class SubmissionGrader:
         # Computed here, in the main process: the result must carry the configuration the job was
         # submitted with, even if the test script changes before the result is recorded
         self.perf_hash = task.performance_hash()
+        self.helper_path = stage_helpers(workdir, task._helper_sources())
         # Resolve relative config paths in the coordinator, before jobs change directory.
         self.setup_script = Path(task.setup_script).resolve() if task.setup_script else None
         self.workdir = workdir
@@ -199,11 +201,15 @@ class SubmissionGrader:
     def _run_test_script(self, script: Path, cwd: Path) -> tuple[int | None, str, str]:
         """Run the test script in its own process group. Returns (returncode, stdout, stderr); returncode is None on timeout."""
         command = [script]
+        env = os.environ.copy()
+        if helper_path := getattr(self, "helper_path", None):
+            # Only the standalone package is exposed, not the grader's source tree.
+            env["PYTHONPATH"] = str(helper_path) + (os.pathsep + env["PYTHONPATH"] if env.get("PYTHONPATH") else "")
         if setup_script := getattr(self, "setup_script", None):
             # A login shell initializes the cluster's module command. Source and exec in the
             # same shell so Python scripts inherit exports; positional args avoid shell injection.
             command = ["bash", "-l", "-c", 'set -e\nsource "$1"\nexec "$2"', "grader-setup", str(setup_script), str(script)]
-        process = subprocess.Popen(command, cwd=cwd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, start_new_session=True)
+        process = subprocess.Popen(command, cwd=cwd, env=env, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, start_new_session=True)
         try:
             stdout, stderr = process.communicate(timeout=self.task.submission_timeout)
             return process.returncode, stdout, stderr
